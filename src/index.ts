@@ -146,27 +146,9 @@ async function pollTranscript(): Promise<void> {
       lastSessionId = sessionId;
     }
 
-    // Record poll start time BEFORE the fetch (used for updated_since on next poll).
-    // Subtract 5s buffer to tolerate clock skew between GM assistant and Discord bot.
-    const pollStartTime = new Date(Date.now() - 5_000).toISOString();
-
-    // Incremental fetch: get new segments AND updated (interim→final) segments.
-    // - after_id: segments with id > lastTranscriptRowId (new rows)
-    // - updated_since: segments updated since last poll (in-place interim→final corrections)
-    let uri = `session://${sessionId}/transcript`;
-    const params: string[] = [];
-    if (lastTranscriptRowId > 0) {
-      params.push(`after_id=${lastTranscriptRowId}`);
-    } else {
-      // Initial sync: cap to last 500 segments to avoid massive payloads
-      params.push(`limit=${TRANSCRIPT_CACHE_SIZE}`);
-    }
-    if (lastTranscriptPollTime) {
-      params.push(`updated_since=${encodeURIComponent(lastTranscriptPollTime)}`);
-    }
-    if (params.length > 0) {
-      uri += '?' + params.join('&');
-    }
+    // Fetch all transcript segments (no query params — MCP SDK URI template
+    // matching doesn't support query strings). Filter client-side by cursor.
+    const uri = `session://${sessionId}/transcript`;
 
     const raw = await mcp.readResource('discord', uri);
     if (!raw) return;
@@ -180,19 +162,20 @@ async function pollTranscript(): Promise<void> {
       displayName?: string;
       isFinal?: boolean;
     }>;
-    if (rawSegments.length === 0) {
-      lastTranscriptPollTime = pollStartTime;
-      return;
-    }
+    if (rawSegments.length === 0) return;
 
-    // Separate new segments (after_id) from updated segments (same id, updated content)
+    // Client-side incremental: separate new vs already-seen segments
     const newSegments: typeof rawSegments = [];
     const updatedSegments: typeof rawSegments = [];
     for (const seg of rawSegments) {
       if (seg.id > lastTranscriptRowId) {
         newSegments.push(seg);
       } else {
-        updatedSegments.push(seg);
+        // Check if cached text differs (interim → final update)
+        const cached = transcriptCache.find((c) => c.rowId === seg.id);
+        if (cached && cached.text !== seg.transcript) {
+          updatedSegments.push(seg);
+        }
       }
     }
 
@@ -214,8 +197,6 @@ async function pollTranscript(): Promise<void> {
         lastTranscriptRowId = maxId;
       }
     }
-
-    lastTranscriptPollTime = pollStartTime;
 
     // Map and cache new segments
     const mapped: CachedSegment[] = newSegments.map((s) => ({
