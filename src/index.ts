@@ -208,28 +208,24 @@ async function pollTranscript(): Promise<void> {
     }));
 
     if (mapped.length > 0) {
-      // Log non-empty new segments for diagnostics
-      const nonEmpty = mapped.filter((s) => s.text.trim().length > 0);
-      if (nonEmpty.length > 0) {
-        logger.info(`Transcript poll: ${mapped.length} new segments (${nonEmpty.length} non-empty), IDs ${mapped[0].rowId}-${mapped[mapped.length - 1].rowId}`);
-        for (const s of nonEmpty) {
-          logger.info(`  [${s.rowId}] "${s.text.trim().slice(0, 80)}"`);
-        }
-      }
-
       transcriptCache.push(...mapped);
       // Trim cache to ring buffer size
       if (transcriptCache.length > TRANSCRIPT_CACHE_SIZE) {
         transcriptCache.splice(0, transcriptCache.length - TRANSCRIPT_CACHE_SIZE);
       }
 
-      // Feed only new segments to trigger detector (not updates)
-      if (triggers) {
-        triggers.onTranscriptUpdate(mapped.map((s) => ({
-          text: s.text,
+      // Feed only FINAL segments to trigger detector for question detection.
+      // Interim segments produce noisy partial matches ("generate?", "name?", etc.)
+      // that flood the trigger queue with duplicate priority-4 events.
+      const finalSegments = newSegments.filter((s) => s.isFinal);
+      if (triggers && finalSegments.length > 0) {
+        const forTrigger = finalSegments.map((s) => ({
+          text: s.transcript,
           userId: s.userId,
-          timestamp: s.timestamp,
-        })));
+          timestamp: s.segmentStart,
+        }));
+        logger.info(`Transcript poll: ${finalSegments.length} final segments for trigger detection`);
+        triggers.onTranscriptUpdate(forTrigger);
       }
     }
   } catch (err) {
