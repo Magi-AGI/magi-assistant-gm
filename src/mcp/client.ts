@@ -32,7 +32,7 @@ export interface McpAggregatorEvents {
 export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
   private servers = new Map<string, ServerConnection>();
   private reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private serverConfigs: Array<{ name: string; url: string; required: boolean }> = [];
+  private serverConfigs: Array<{ name: string; url: string; token: string; required: boolean }> = [];
   private _shuttingDown = false;
   private _cleaningUp = false;
 
@@ -44,16 +44,16 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
     const config = getConfig();
 
     this.serverConfigs = [
-      { name: 'discord', url: config.discordMcpUrl, required: true },
-      { name: 'foundry', url: config.foundryMcpUrl, required: true },
+      { name: 'discord', url: config.discordMcpUrl, token: config.discordMcpToken, required: true },
+      { name: 'foundry', url: config.foundryMcpUrl, token: config.foundryMcpToken, required: true },
     ];
 
     if (config.wikiMcpUrl) {
-      this.serverConfigs.push({ name: 'wiki', url: config.wikiMcpUrl, required: false });
+      this.serverConfigs.push({ name: 'wiki', url: config.wikiMcpUrl, token: config.wikiMcpToken, required: false });
     }
 
     const results = await Promise.allSettled(
-      this.serverConfigs.map((conn) => this.connectServer(conn.name, conn.url, conn.required))
+      this.serverConfigs.map((conn) => this.connectServer(conn.name, conn.url, conn.token, conn.required))
     );
 
     // Check for required connection failures
@@ -86,18 +86,17 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
     }
   }
 
-  private async connectServer(name: string, baseUrl: string, required: boolean): Promise<void> {
-    const config = getConfig();
+  private async connectServer(name: string, baseUrl: string, token: string, required: boolean): Promise<void> {
     const sseUrl = new URL('/sse', baseUrl);
-    if (config.mcpAuthToken) {
-      sseUrl.searchParams.set('token', config.mcpAuthToken);
+    if (token) {
+      sseUrl.searchParams.set('token', token);
     }
 
     // Pass auth in both query param (for SSE GET) and requestInit headers (for POST)
     const transport = new SSEClientTransport(sseUrl, {
       requestInit: {
-        headers: config.mcpAuthToken
-          ? { Authorization: `Bearer ${config.mcpAuthToken}` }
+        headers: token
+          ? { Authorization: `Bearer ${token}` }
           : {},
       },
     });
@@ -138,7 +137,7 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
       if (this._shuttingDown || this._cleaningUp) return;
       logger.warn(`MCP aggregator: lost connection to '${name}' — scheduling reconnect`);
       this.servers.delete(name);
-      this.scheduleReconnect(name, baseUrl, required);
+      this.scheduleReconnect(name, baseUrl, token, required);
     };
 
     transport.onerror = (err) => {
@@ -148,7 +147,7 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
     };
   }
 
-  private scheduleReconnect(name: string, baseUrl: string, required: boolean, attempt = 1): void {
+  private scheduleReconnect(name: string, baseUrl: string, token: string, required: boolean, attempt = 1): void {
     if (this._shuttingDown) return;
     if (this.reconnectTimers.has(name)) return; // Already scheduled
 
@@ -159,11 +158,11 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
     const timer = setTimeout(async () => {
       this.reconnectTimers.delete(name);
       try {
-        await this.connectServer(name, baseUrl, required);
+        await this.connectServer(name, baseUrl, token, required);
         logger.info(`MCP aggregator: reconnected to '${name}'`);
       } catch (err) {
         logger.warn(`MCP aggregator: reconnect to '${name}' failed:`, err);
-        this.scheduleReconnect(name, baseUrl, required, attempt + 1);
+        this.scheduleReconnect(name, baseUrl, token, required, attempt + 1);
       }
     }, delay);
 

@@ -9,7 +9,9 @@ export interface GmConfig {
   discordMcpUrl: string;
   foundryMcpUrl: string;
   wikiMcpUrl: string;
-  mcpAuthToken: string;
+  discordMcpToken: string;
+  foundryMcpToken: string;
+  wikiMcpToken: string;
   discordAdviceWebhookUrl: string;
   heartbeatIntervalMinutes: number;
   eventBatchWindowSeconds: number;
@@ -40,11 +42,15 @@ export function getConfig(): GmConfig {
   if (_config) return _config;
 
   const anthropicApiKey = process.env.ANTHROPIC_API_KEY ?? '';
-  const mcpAuthToken = process.env.MCP_AUTH_TOKEN ?? '';
+  const discordMcpToken = process.env.DISCORD_MCP_TOKEN ?? '';
+  const foundryMcpToken = process.env.FOUNDRY_MCP_TOKEN ?? '';
+  const wikiMcpToken = process.env.WIKI_MCP_TOKEN ?? '';
 
   // Register secrets for log redaction
   if (anthropicApiKey) registerSecret(anthropicApiKey);
-  if (mcpAuthToken) registerSecret(mcpAuthToken);
+  if (discordMcpToken) registerSecret(discordMcpToken);
+  if (foundryMcpToken) registerSecret(foundryMcpToken);
+  if (wikiMcpToken) registerSecret(wikiMcpToken);
 
   _config = {
     anthropicApiKey,
@@ -52,7 +58,9 @@ export function getConfig(): GmConfig {
     discordMcpUrl: process.env.DISCORD_MCP_URL ?? 'http://127.0.0.1:3001',
     foundryMcpUrl: process.env.FOUNDRY_MCP_URL ?? 'http://127.0.0.1:3002',
     wikiMcpUrl: process.env.WIKI_MCP_URL ?? '',
-    mcpAuthToken,
+    discordMcpToken,
+    foundryMcpToken,
+    wikiMcpToken,
     discordAdviceWebhookUrl: process.env.DISCORD_ADVICE_WEBHOOK_URL ?? '',
     heartbeatIntervalMinutes: parseInt(process.env.HEARTBEAT_INTERVAL_MINUTES ?? '5', 10) || 5,
     eventBatchWindowSeconds: parseInt(process.env.EVENT_BATCH_WINDOW_SECONDS ?? '30', 10) || 30,
