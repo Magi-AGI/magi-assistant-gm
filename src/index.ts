@@ -252,7 +252,7 @@ async function pollTranscript(): Promise<void> {
       }
     }
   } catch (err) {
-    logger.debug('Transcript poll error:', err);
+    logger.warn('Transcript poll error:', err);
   } finally {
     transcriptPollInFlight = false;
   }
