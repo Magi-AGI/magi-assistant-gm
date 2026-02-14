@@ -227,6 +227,15 @@ async function pollTranscript(): Promise<void> {
     }));
 
     if (mapped.length > 0) {
+      // Log non-empty new segments for diagnostics
+      const nonEmpty = mapped.filter((s) => s.text.trim().length > 0);
+      if (nonEmpty.length > 0) {
+        logger.info(`Transcript poll: ${mapped.length} new segments (${nonEmpty.length} non-empty), IDs ${mapped[0].rowId}-${mapped[mapped.length - 1].rowId}`);
+        for (const s of nonEmpty) {
+          logger.info(`  [${s.rowId}] "${s.text.trim().slice(0, 80)}"`);
+        }
+      }
+
       transcriptCache.push(...mapped);
       // Trim cache to ring buffer size
       if (transcriptCache.length > TRANSCRIPT_CACHE_SIZE) {
@@ -242,8 +251,8 @@ async function pollTranscript(): Promise<void> {
         })));
       }
     }
-  } catch {
-    // Transcript may not be available (no active session) — that's fine
+  } catch (err) {
+    logger.debug('Transcript poll error:', err);
   } finally {
     transcriptPollInFlight = false;
   }

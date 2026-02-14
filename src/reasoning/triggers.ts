@@ -67,6 +67,7 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
   onTranscriptUpdate(segments: Array<{ text: string; userId?: string; timestamp: string }>): void {
     for (const seg of segments) {
       if (this.isQuestion(seg.text)) {
+        logger.info(`TriggerDetector: question detected — "${seg.text.trim().slice(0, 80)}" (userId=${seg.userId ?? 'unknown'})`);
         this.addEvent({
           type: 'question',
           source: seg.userId ?? 'unknown',
