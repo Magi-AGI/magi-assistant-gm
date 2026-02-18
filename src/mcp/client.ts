@@ -38,7 +38,7 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
 
   /**
    * Connect to all configured MCP servers in parallel.
-   * Wiki failure is non-fatal (logs warning and continues).
+   * v2: All three servers are required (wiki is a hard gate).
    */
   async connect(): Promise<void> {
     const config = getConfig();
@@ -48,8 +48,9 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
       { name: 'foundry', url: config.foundryMcpUrl, token: config.foundryMcpToken, required: true },
     ];
 
+    // v2: Wiki is required (hard gate)
     if (config.wikiMcpUrl) {
-      this.serverConfigs.push({ name: 'wiki', url: config.wikiMcpUrl, token: config.wikiMcpToken, required: false });
+      this.serverConfigs.push({ name: 'wiki', url: config.wikiMcpUrl, token: config.wikiMcpToken, required: true });
     }
 
     const results = await Promise.allSettled(
@@ -233,6 +234,36 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
   /** Check if a specific server is connected. */
   isConnected(serverName: string): boolean {
     return this.servers.has(serverName);
+  }
+
+  /**
+   * Health check: verify a server responds to a lightweight probe.
+   * Returns true if healthy, false if not connected or probe fails.
+   */
+  async healthCheck(serverName: string): Promise<boolean> {
+    if (!this.isConnected(serverName)) return false;
+    try {
+      // Use a lightweight probe per server type
+      switch (serverName) {
+        case 'discord':
+          await this.readResource('discord', 'session://active', 5000);
+          break;
+        case 'foundry':
+          await this.readResource('foundry', 'game://state', 5000);
+          break;
+        case 'wiki': {
+          // Wiki health: listTools is lightweight and doesn't depend on any specific card existing
+          const conn = this.servers.get('wiki');
+          if (conn) await conn.client.listTools();
+          break;
+        }
+        default:
+          return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** Disconnect from all servers and cancel pending reconnects. */

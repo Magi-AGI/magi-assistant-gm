@@ -1,43 +1,69 @@
+/**
+ * Magi GM Assistant v2 — Event-driven orchestrator.
+ *
+ * Replaces v1 dual polling loops + heartbeat with:
+ * - P1-P4 priority triggers
+ * - PREGAME/ACTIVE/SLEEP state machine
+ * - Wiki hard gate
+ * - Image queue integration
+ * - GM command parsing from Foundry chat
+ */
+
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
 
 import { getConfig } from './config.js';
 import { logger } from './logger.js';
 import { McpAggregator } from './mcp/client.js';
+import { PacingStateManager } from './state/pacing.js';
+import { AdviceMemoryBuffer } from './state/advice-memory.js';
 import { TriggerDetector } from './reasoning/triggers.js';
 import { ReasoningEngine } from './reasoning/engine.js';
 import { AdviceDelivery } from './output/index.js';
+import { ImageQueue } from './output/image-queue.js';
+import { parseGmCommand } from './state/gm-commands.js';
+import { AssistantState } from './types/index.js';
 
 const config = getConfig();
 
+// ── Core components ────────────────────────────────────────────────────────
+
 const mcp = new McpAggregator();
+const pacing = new PacingStateManager();
+const memory = new AdviceMemoryBuffer(config.adviceMemorySize);
+const imageQueue = new ImageQueue();
+
 let triggers: TriggerDetector | null = null;
 let engine: ReasoningEngine | null = null;
 let delivery: AdviceDelivery | null = null;
+
+// ── Polling state ──────────────────────────────────────────────────────────
+
 let transcriptPollTimer: ReturnType<typeof setInterval> | null = null;
 let gameStatePollTimer: ReturnType<typeof setInterval> | null = null;
+let pacingUpdateTimer: ReturnType<typeof setInterval> | null = null;
 let lastTranscriptRowId = 0;
-let lastTranscriptPollTime: string | null = null;
 let lastSessionId: string | null = null;
-let lastCombatRound: number | null = null;
 let lastSceneId: string | null = null;
 let lastSeenChatMsgId: string | null = null;
 let transcriptPollInFlight = false;
 let gameStatePollInFlight = false;
+let lastTextEventId = 0;
+let sessionJustChanged = false;
 
-// Local transcript cache — ring buffer of recent segments for context assembly.
-// Populated incrementally via ?after_id= polling (avoids re-downloading the full transcript).
+// Local transcript cache — ring buffer of recent segments
 const TRANSCRIPT_CACHE_SIZE = 500;
 interface CachedSegment {
   rowId: number;
   text: string;
   userId?: string;
   displayName?: string;
+  speakerLabel?: string;
   timestamp: string;
 }
 const transcriptCache: CachedSegment[] = [];
 
-// --- Graceful shutdown ---
+// ── Graceful shutdown ──────────────────────────────────────────────────────
 
 let isShuttingDown = false;
 
@@ -48,17 +74,14 @@ async function gracefulShutdown(signal: string): Promise<void> {
   logger.info(`Received ${signal} — starting graceful shutdown...`);
 
   try {
-    if (transcriptPollTimer) {
-      clearInterval(transcriptPollTimer);
-      transcriptPollTimer = null;
-    }
-    if (gameStatePollTimer) {
-      clearInterval(gameStatePollTimer);
-      gameStatePollTimer = null;
-    }
-    if (triggers) {
-      triggers.stop();
-    }
+    if (transcriptPollTimer) clearInterval(transcriptPollTimer);
+    if (gameStatePollTimer) clearInterval(gameStatePollTimer);
+    if (pacingUpdateTimer) clearInterval(pacingUpdateTimer);
+    transcriptPollTimer = null;
+    gameStatePollTimer = null;
+    pacingUpdateTimer = null;
+
+    if (triggers) triggers.stop();
     await mcp.disconnect();
     logger.info('Shutdown complete. Goodbye.');
   } catch (err) {
@@ -80,26 +103,23 @@ process.on('uncaughtException', (err) => {
   gracefulShutdown('uncaughtException');
 });
 
-// --- Transcript polling ---
+// ── Transcript polling ─────────────────────────────────────────────────────
 
 async function pollTranscript(): Promise<void> {
   if (!mcp.isConnected('discord')) return;
-  if (transcriptPollInFlight) return; // Prevent reentrancy
+  if (transcriptPollInFlight) return;
   transcriptPollInFlight = true;
 
   try {
-    // Read active session info to get the real session ID
-    // Discord returns { active: bool, sessions: [{ id, guildId, ... }] }
+    // Read active session
     let sessionId: string | null = null;
     try {
       const sessionRaw = await mcp.readResource('discord', 'session://active');
       if (sessionRaw) {
         const session = JSON.parse(sessionRaw);
         if (!session.active || !session.sessions?.length) {
-          // No active session — clear stale transcript cache so heartbeat/game-event
-          // advice doesn't reference a previous session's conversation
           if (transcriptCache.length > 0) {
-            logger.info('Transcript poll: no active session — clearing transcript cache');
+            logger.info('Transcript poll: no active session — clearing cache');
             transcriptCache.length = 0;
             lastTranscriptRowId = 0;
             lastSessionId = null;
@@ -108,124 +128,186 @@ async function pollTranscript(): Promise<void> {
         }
 
         const sessions = session.sessions as Array<{ id: string; guildId?: string }>;
-
-        // If targetGuildId is configured, find the matching session
         const targetGuild = config.targetGuildId;
         if (targetGuild) {
-          const match = sessions.find((s) => s.guildId === targetGuild);
+          const match = sessions.find(s => s.guildId === targetGuild);
           sessionId = match?.id ?? null;
         } else {
           if (sessions.length > 1) {
-            logger.warn(`Transcript poll: ${sessions.length} active sessions but TARGET_GUILD_ID is not set — using first session. Set TARGET_GUILD_ID to target a specific guild.`);
+            logger.warn(`Transcript poll: ${sessions.length} active sessions — set TARGET_GUILD_ID`);
           }
           sessionId = sessions[0].id ?? null;
         }
       }
     } catch {
-      return; // Can't determine session — skip this poll
+      return;
     }
 
     if (!sessionId) {
-      // targetGuildId is set but no matching session — clear stale cache
       if (lastSessionId !== null && transcriptCache.length > 0) {
-        logger.info('Transcript poll: no matching session for TARGET_GUILD_ID — clearing transcript cache');
+        logger.info('Transcript poll: no matching session — clearing cache');
         transcriptCache.length = 0;
         lastTranscriptRowId = 0;
-        lastTranscriptPollTime = null;
         lastSessionId = null;
       }
       return;
     }
 
-    // Reset cursor and cache on session change
+    // Reset on session change — skip trigger feeding on first poll to avoid replaying history
     if (sessionId !== lastSessionId) {
-      logger.info(`Transcript poll: session changed (${lastSessionId} → ${sessionId}), resetting cursor`);
+      logger.info(`Transcript poll: session changed (${lastSessionId} → ${sessionId})`);
       lastTranscriptRowId = 0;
-      lastTranscriptPollTime = null;
       transcriptCache.length = 0;
       lastSessionId = sessionId;
+      sessionJustChanged = true;
     }
 
-    // Fetch all transcript segments (no query params — MCP SDK URI template
-    // matching doesn't support query strings). Filter client-side by cursor.
-    const uri = `session://${sessionId}/transcript`;
-
-    const raw = await mcp.readResource('discord', uri);
+    const raw = await mcp.readResource('discord', `session://${sessionId}/transcript`);
     if (!raw) return;
 
-    // Discord MCP returns segments as { id, transcript, segmentStart, userId, displayName, isFinal, ... }
     const rawSegments = JSON.parse(raw) as Array<{
       id: number;
       transcript: string;
       segmentStart: string;
       userId?: string;
       displayName?: string;
+      speakerLabel?: string;
       isFinal?: boolean;
     }>;
     if (rawSegments.length === 0) return;
 
-    // Client-side incremental: separate new vs already-seen segments
+    // Client-side incremental: new vs updated
     const newSegments: typeof rawSegments = [];
     const updatedSegments: typeof rawSegments = [];
     for (const seg of rawSegments) {
       if (seg.id > lastTranscriptRowId) {
         newSegments.push(seg);
       } else {
-        // Check if cached text differs (interim → final update)
-        const cached = transcriptCache.find((c) => c.rowId === seg.id);
+        const cached = transcriptCache.find(c => c.rowId === seg.id);
         if (cached && cached.text !== seg.transcript) {
           updatedSegments.push(seg);
         }
       }
     }
 
-    // Apply in-place updates to cached segments (interim → final corrections, speaker mappings)
+    // Apply in-place updates and re-feed newly-finalized segments to triggers
+    // Fix #4: interim→final updates must be detected for P1/P2 keywords
+    const newlyFinalized: typeof rawSegments = [];
     for (const updated of updatedSegments) {
-      const idx = transcriptCache.findIndex((c) => c.rowId === updated.id);
+      const idx = transcriptCache.findIndex(c => c.rowId === updated.id);
       if (idx >= 0) {
         transcriptCache[idx].text = updated.transcript;
         if (updated.displayName) {
           transcriptCache[idx].displayName = updated.displayName;
         }
+        // If this segment just became final, it needs trigger detection
+        if (updated.isFinal) {
+          newlyFinalized.push(updated);
+        }
       }
     }
+    if (triggers && newlyFinalized.length > 0) {
+      const forTrigger = newlyFinalized.map(s => ({
+        text: s.transcript,
+        userId: s.userId,
+        displayName: s.displayName,
+        speakerLabel: s.speakerLabel,
+        timestamp: s.segmentStart,
+      }));
+      triggers.onTranscriptUpdate(forTrigger);
+    }
 
-    // Update cursor to highest new row ID
+    // Update cursor
     if (newSegments.length > 0) {
-      const maxId = Math.max(...newSegments.map((s) => s.id));
+      const maxId = Math.max(...newSegments.map(s => s.id));
       if (maxId > lastTranscriptRowId) {
         lastTranscriptRowId = maxId;
       }
     }
 
-    // Map and cache new segments
-    const mapped: CachedSegment[] = newSegments.map((s) => ({
+    // Cache new segments
+    const mapped: CachedSegment[] = newSegments.map(s => ({
       rowId: s.id,
       text: s.transcript,
       userId: s.userId,
       displayName: s.displayName,
+      speakerLabel: s.speakerLabel,
       timestamp: s.segmentStart,
     }));
 
     if (mapped.length > 0) {
       transcriptCache.push(...mapped);
-      // Trim cache to ring buffer size
       if (transcriptCache.length > TRANSCRIPT_CACHE_SIZE) {
         transcriptCache.splice(0, transcriptCache.length - TRANSCRIPT_CACHE_SIZE);
       }
 
-      // Feed only FINAL segments to trigger detector for question detection.
-      // Interim segments produce noisy partial matches ("generate?", "name?", etc.)
-      // that flood the trigger queue with duplicate priority-4 events.
-      const finalSegments = newSegments.filter((s) => s.isFinal);
-      if (triggers && finalSegments.length > 0) {
-        const forTrigger = finalSegments.map((s) => ({
-          text: s.transcript,
-          userId: s.userId,
-          timestamp: s.segmentStart,
-        }));
-        logger.info(`Transcript poll: ${finalSegments.length} final segments for trigger detection`);
-        triggers.onTranscriptUpdate(forTrigger);
+      // Fix #6: Skip trigger feeding on the first poll after a session change
+      // to avoid replaying historical transcript into trigger detection.
+      if (sessionJustChanged) {
+        sessionJustChanged = false;
+        logger.info(`Transcript poll: seeded ${mapped.length} historical segments (triggers skipped)`);
+      } else {
+        // Feed only FINAL segments to trigger detector (per config)
+        const finalOnly = config.finalSegmentsOnly;
+        const toDetect = finalOnly
+          ? newSegments.filter(s => s.isFinal)
+          : newSegments;
+
+        if (triggers && toDetect.length > 0) {
+          const forTrigger = toDetect.map(s => ({
+            text: s.transcript,
+            userId: s.userId,
+            displayName: s.displayName,
+            speakerLabel: s.speakerLabel,
+            timestamp: s.segmentStart,
+          }));
+          triggers.onTranscriptUpdate(forTrigger);
+        }
+      }
+    }
+    // Always poll text events to keep cursor current (prevents stale /yes replay).
+    // Only act on /yes /no when an image is actually pending.
+    if (lastSessionId) {
+      try {
+        const textRaw = await mcp.readResource('discord', `session://${lastSessionId}/text-events`);
+        if (textRaw) {
+          const textEvents = JSON.parse(textRaw) as Array<{
+            id?: number;
+            content?: string;
+            eventType?: string;
+          }>;
+          for (const evt of textEvents) {
+            const evtId = evt.id ?? 0;
+            if (evtId <= lastTextEventId) continue;
+            lastTextEventId = evtId;
+
+            if (evt.eventType !== 'create') continue;
+            // Auth note: /yes and /no slash commands are already gated by the
+            // Discord bot (GM role check + session text channel restriction).
+            // GM_IDENTIFIER is for speech identity (diarization labels), not
+            // Discord user IDs, so we don't duplicate the check here.
+            const content = evt.content?.trim().toLowerCase();
+            if (content === '/yes' && imageQueue.hasPending()) {
+              const suggestion = imageQueue.confirm();
+              if (suggestion && mcp.isConnected('discord')) {
+                try {
+                  await mcp.callTool('discord__post_image', {
+                    imageUrl: `http://localhost:30000/${suggestion.path}`,
+                    caption: suggestion.description,
+                    channelId: suggestion.post_to || undefined,
+                  });
+                  logger.info(`Image posted: ${suggestion.path}`);
+                } catch (err) {
+                  logger.warn('Failed to post image:', err);
+                }
+              }
+            } else if (content === '/no' && imageQueue.hasPending()) {
+              imageQueue.reject();
+            }
+          }
+        }
+      } catch {
+        // Text events may not be available — non-fatal
       }
     }
   } catch (err) {
@@ -235,11 +317,11 @@ async function pollTranscript(): Promise<void> {
   }
 }
 
-// --- Game state polling ---
+// ── Game state polling ─────────────────────────────────────────────────────
 
 async function pollGameState(): Promise<void> {
   if (!mcp.isConnected('foundry') || !triggers) return;
-  if (gameStatePollInFlight) return; // Prevent reentrancy
+  if (gameStatePollInFlight) return;
   gameStatePollInFlight = true;
 
   try {
@@ -248,126 +330,259 @@ async function pollGameState(): Promise<void> {
 
     const state = JSON.parse(raw);
 
-    // Skip event processing if Foundry is disconnected — state is stale.
-    // Reset cursors so reconnect doesn't produce spurious "changed" events.
     if (state.connectedAt === null) {
-      lastCombatRound = null;
       lastSceneId = null;
       lastSeenChatMsgId = null;
       return;
     }
 
-    // Detect combat changes
-    if (state.combat) {
-      const round = state.combat.round as number;
-      if (lastCombatRound === null) {
-        // Combat started
-        triggers.onGameEvent('combatUpdate', { started: true, round });
-        lastCombatRound = round;
-      } else if (round !== lastCombatRound) {
-        triggers.onGameEvent('combatUpdate', { round, previousRound: lastCombatRound });
-        lastCombatRound = round;
-      }
-    } else if (lastCombatRound !== null) {
-      // Combat ended
-      triggers.onGameEvent('combatUpdate', { ended: true });
-      lastCombatRound = null;
-    }
-
-    // Detect scene changes
+    // Detect scene changes → trigger P2
     const sceneId = state.scene?.id ?? null;
     if (sceneId !== lastSceneId && lastSceneId !== null) {
-      triggers.onGameEvent('sceneChange', { sceneId, sceneName: state.scene?.name ?? '' });
+      triggers.onGameEvent('sceneChange', {
+        sceneId,
+        sceneName: state.scene?.name ?? '',
+      });
     }
     lastSceneId = sceneId;
 
-    // Detect new chat messages with rolls — track by last seen message ID
-    // (array length stays at 50 once full, so length-based tracking breaks)
-    const chat = state.recentChat as Array<{ id?: string; rolls?: unknown[]; speakerAlias?: string }>;
+    // Parse GM commands from new Foundry chat messages (GM-only)
+    const chat = state.recentChat as Array<{
+      id?: string;
+      content?: string;
+      speakerAlias?: string;
+      isGm?: boolean;
+      timestamp?: string;
+    }>;
     if (chat.length > 0) {
       if (!lastSeenChatMsgId) {
-        // First poll — just set cursor, don't replay history
         lastSeenChatMsgId = chat[chat.length - 1].id ?? null;
       } else {
-        const lastIdx = chat.findIndex((m) => m.id === lastSeenChatMsgId);
+        const lastIdx = chat.findIndex(m => m.id === lastSeenChatMsgId);
         if (lastIdx >= 0) {
-          // Found cursor — process messages after it
           const newMessages = chat.slice(lastIdx + 1);
           for (const msg of newMessages) {
-            if (msg.rolls && msg.rolls.length > 0) {
-              triggers.onGameEvent('chatMessage', { hasRoll: true, speaker: msg.speakerAlias });
+            // Only accept GM commands from GM-authored messages (strict check)
+            if (msg.content && msg.isGm === true) {
+              const cmd = parseGmCommand(msg.content, msg.timestamp ?? new Date().toISOString());
+              if (cmd) {
+                applyGmCommand(cmd);
+              }
             }
           }
         }
-        // If not found, cursor scrolled out of the 50-item window.
-        // Skip this poll cycle rather than replaying everything as "new".
-        // We'll pick up genuinely new messages on the next poll.
-
-        // Advance cursor to latest message
         lastSeenChatMsgId = chat[chat.length - 1].id ?? lastSeenChatMsgId;
       }
     }
   } catch {
-    // Foundry state may not be available — that's fine
+    // Foundry state may not be available
   } finally {
     gameStatePollInFlight = false;
   }
 }
 
-// --- Startup ---
+// ── GM Command Application ─────────────────────────────────────────────────
+
+function applyGmCommand(cmd: import('./types/index.js').GmCommand): void {
+  logger.info(`GM command: ${cmd.raw}`);
+
+  switch (cmd.type) {
+    case 'act': {
+      const actNum = parseInt(cmd.args[0], 10);
+      const planned = parseInt(cmd.args[1], 10) || 0;
+      if (Number.isFinite(actNum)) {
+        pacing.advanceAct(actNum, planned);
+        if (pacing.assistantState === AssistantState.PREGAME) {
+          pacing.transitionTo(AssistantState.ACTIVE);
+        }
+      }
+      break;
+    }
+    case 'scene': {
+      // Fix #7: If the last arg is a number, treat it as planned minutes, not part of the name
+      let sceneName: string;
+      let planned = 0;
+      const lastArg = cmd.args[cmd.args.length - 1];
+      if (cmd.args.length > 1 && /^\d+$/.test(lastArg)) {
+        planned = parseInt(lastArg, 10);
+        sceneName = cmd.args.slice(0, -1).join(' ');
+      } else {
+        sceneName = cmd.args.join(' ');
+      }
+      pacing.advanceScene(sceneName, planned);
+      if (pacing.assistantState === AssistantState.PREGAME) {
+        pacing.transitionTo(AssistantState.ACTIVE);
+      }
+      break;
+    }
+    case 'spotlight': {
+      const player = cmd.args[0];
+      const debt = parseInt(cmd.args[1], 10) || 0;
+      if (player) pacing.setSpotlight(player, debt);
+      break;
+    }
+    case 'engagement': {
+      const player = cmd.args[0];
+      const level = cmd.args[1]?.toUpperCase() as 'HIGH' | 'MEDIUM' | 'LOW';
+      if (player && level) pacing.setEngagement(player, level);
+      break;
+    }
+    case 'separation': {
+      const status = cmd.args[0]?.toUpperCase() as 'NORMAL' | 'SPLIT' | 'CRITICAL';
+      if (status) pacing.setSeparation(status);
+      break;
+    }
+    case 'climax': {
+      const proximity = cmd.args[0]?.toUpperCase() as 'NORMAL' | 'APPROACHING' | 'ESCALATING' | 'CLIMAX';
+      if (proximity) pacing.setClimaxProximity(proximity);
+      break;
+    }
+    case 'seed': {
+      const seedName = cmd.args.join(' ');
+      if (seedName) pacing.addSeed(seedName, pacing.state.current_scene);
+      break;
+    }
+    case 'sleep':
+      pacing.transitionTo(AssistantState.SLEEP);
+      logger.info('GM command: ACTIVE → SLEEP');
+      break;
+    case 'wake':
+      pacing.transitionTo(AssistantState.ACTIVE);
+      logger.info('GM command: → ACTIVE');
+      break;
+  }
+}
+
+// ── Startup ────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  logger.info('Magi GM Assistant starting...');
+  logger.info('Magi GM Assistant v2 starting...');
   logger.info(`  Model: ${config.anthropicModel}`);
   logger.info(`  Discord MCP: ${config.discordMcpUrl}`);
   logger.info(`  Foundry MCP: ${config.foundryMcpUrl}`);
-  logger.info(`  Wiki MCP: ${config.wikiMcpUrl || '(disabled)'}`);
+  logger.info(`  Wiki MCP: ${config.wikiMcpUrl || '(NOT SET — REQUIRED)'}`);
 
-  // 1. Connect MCP aggregator
-  await mcp.connect();
+  // ── Step 1: Validate wiki URL ──────────────────────────────────────────
+  if (!config.wikiMcpUrl) {
+    throw new Error('WIKI_MCP_URL is required in v2. Cannot start without wiki access.');
+  }
 
-  const tools = mcp.getAllTools();
-  logger.info(`MCP aggregator: ${tools.length} total tools available`);
+  // ── Step 2+3: Connect and health-check all MCP servers (with retry) ──
+  // Both connect and health check are covered by the retry loop, so
+  // transient wiki outages at startup don't cause immediate failure.
+  const STARTUP_RETRIES = 3;
+  const STARTUP_BACKOFF_BASE_MS = 2000;
+  let wikiHealthy = false;
 
-  // 2. Create reasoning engine + advice delivery
-  engine = new ReasoningEngine(mcp, () => [...transcriptCache]);
+  for (let attempt = 1; attempt <= STARTUP_RETRIES; attempt++) {
+    try {
+      if (!mcp.isConnected('wiki')) {
+        await mcp.connect();
+        const tools = mcp.getAllTools();
+        logger.info(`MCP aggregator: ${tools.length} total tools available`);
+      }
+
+      const healthResults = await Promise.all([
+        mcp.healthCheck('discord'),
+        mcp.healthCheck('foundry'),
+        mcp.healthCheck('wiki'),
+      ]);
+      const serverNames = ['discord', 'foundry', 'wiki'];
+      for (let i = 0; i < serverNames.length; i++) {
+        logger.info(`  ${serverNames[i]} health: ${healthResults[i] ? 'OK' : 'FAIL'}`);
+      }
+
+      if (healthResults[2]) {
+        wikiHealthy = true;
+        break;
+      }
+    } catch (err) {
+      logger.warn(`MCP startup failed (attempt ${attempt}/${STARTUP_RETRIES}):`, err);
+    }
+
+    if (attempt < STARTUP_RETRIES) {
+      const delayMs = STARTUP_BACKOFF_BASE_MS * Math.pow(2, attempt - 1);
+      logger.warn(`Retrying MCP startup in ${delayMs / 1000}s...`);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+
+  if (!wikiHealthy) {
+    throw new Error(`Wiki MCP startup failed after ${STARTUP_RETRIES} attempts — cannot start without wiki access.`);
+  }
+
+  // ── Step 3b: Validate episode plan wiki card ──────────────────────────
+  if (config.campaignWikiCard) {
+    try {
+      const planRaw = await mcp.readResource('wiki', `card://${config.campaignWikiCard}`, 10_000);
+      if (planRaw && planRaw.length > 0) {
+        logger.info(`  Episode plan loaded from wiki card: "${config.campaignWikiCard}" (${planRaw.length} chars)`);
+      } else {
+        logger.warn(`  Episode plan wiki card "${config.campaignWikiCard}" exists but is empty — assistant will have no scene knowledge.`);
+      }
+    } catch {
+      logger.error(`  Failed to load episode plan from wiki card "${config.campaignWikiCard}" — check card name spelling. Assistant will run without scene knowledge.`);
+    }
+  } else {
+    logger.warn('  CAMPAIGN_WIKI_CARD not set — assistant will run without episode plan knowledge.');
+  }
+
+  // ── Step 4: Initialize state ──────────────────────────────────────────
+  pacing.startSession();
+  memory.clear();
+  logger.info(`  State: ${pacing.assistantState} | Memory cleared | Advice interval: ${config.minAdviceIntervalSeconds}s`);
+
+  // ── Step 5: Create components ─────────────────────────────────────────
+  engine = new ReasoningEngine(mcp, pacing, memory, () => [...transcriptCache]);
   delivery = new AdviceDelivery(mcp);
 
-  // 3. Create trigger detector, wire trigger → engine → delivery
-  triggers = new TriggerDetector();
+  triggers = new TriggerDetector(pacing);
   triggers.on('trigger', async (batch) => {
     if (!engine || !delivery) return;
 
-    const advice = await engine.process(batch);
-    if (advice) {
-      await delivery.deliver(advice);
+    const envelope = await engine.process(batch);
+    if (envelope) {
+      // Queue image suggestion if present
+      if (envelope.image) {
+        imageQueue.setPending(envelope.image);
+      }
+      await delivery.deliver(envelope);
     }
   });
 
-  // Also deliver advice from queued batches (processed async by engine)
-  engine.on('advice', async (advice) => {
+  // Deliver advice from queued batches
+  engine.on('advice', async (envelope) => {
     if (delivery) {
-      await delivery.deliver(advice);
+      if (envelope.image) {
+        imageQueue.setPending(envelope.image);
+      }
+      await delivery.deliver(envelope);
     }
   });
 
   triggers.start();
 
-  // 4. Poll Discord transcript every 10s
+  // ── Step 6: Start polling loops ───────────────────────────────────────
+
+  // Transcript: 10s
   transcriptPollTimer = setInterval(() => {
-    pollTranscript().catch((err) => {
-      logger.debug('Transcript poll error:', err);
-    });
+    pollTranscript().catch(err => logger.debug('Transcript poll error:', err));
   }, 10_000);
 
-  // 5. Poll Foundry game state every 10s for combat/scene/roll events
+  // Game state: 10s (fallback — SSE preferred if supported)
   gameStatePollTimer = setInterval(() => {
-    pollGameState().catch((err) => {
-      logger.debug('Game state poll error:', err);
-    });
+    pollGameState().catch(err => logger.debug('Game state poll error:', err));
   }, 10_000);
 
-  logger.info('GM Assistant ready — monitoring for triggers');
+  // Pacing timer update: every 30s
+  pacingUpdateTimer = setInterval(() => {
+    pacing.updateElapsed();
+    if (triggers) {
+      triggers.checkPacingOverrun(config.sceneOverrunThresholdMinutes);
+    }
+  }, 30_000);
+
+  logger.info('GM Assistant v2 ready — monitoring for triggers (PREGAME)');
 }
 
 main().catch((err) => {

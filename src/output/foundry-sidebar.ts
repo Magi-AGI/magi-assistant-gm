@@ -1,42 +1,47 @@
 /**
  * Advice delivery to Foundry VTT via whispered chat messages.
- * Uses the foundry__send_whisper MCP tool.
+ * v2: formats AdviceEnvelope with category-colored [TAG] prefix.
  */
 
 import { logger } from '../logger.js';
 import type { McpAggregator } from '../mcp/client.js';
-import type { GmAdvice } from '../types/index.js';
+import type { AdviceEnvelope, AdviceCategory } from '../types/index.js';
 
-/** Trigger type icons for advice messages. */
-function triggerIcon(trigger: string): string {
-  switch (trigger) {
-    case 'question': return '&#10067;'; // ?
-    case 'game_event': return '&#9876;'; // crossed swords
-    case 'heartbeat': return '&#128161;'; // lightbulb
-    case 'on_demand': return '&#128172;'; // speech bubble
-    default: return '&#8505;'; // info
-  }
-}
+/** Category → HTML color for the tag prefix. */
+const CATEGORY_COLORS: Record<AdviceCategory, string> = {
+  script: '#4a9eff',     // blue
+  pacing: '#ff9800',     // orange
+  continuity: '#9c27b0', // purple
+  spotlight: '#4caf50',  // green
+  mechanics: '#795548',  // brown
+  technical: '#607d8b',  // grey
+  creative: '#e91e63',   // pink
+  none: '#9e9e9e',       // grey
+};
 
 export class FoundryAdviceOutput {
   constructor(private mcp: McpAggregator) {}
 
-  async deliver(advice: GmAdvice): Promise<boolean> {
+  async deliver(envelope: AdviceEnvelope): Promise<boolean> {
     if (!this.mcp.isConnected('foundry')) {
       logger.warn('FoundryAdviceOutput: Foundry MCP not connected — skipping');
       return false;
     }
 
-    const icon = triggerIcon(advice.trigger);
-    const html = `<p>${icon} ${advice.advice}</p>`;
-    const title = 'Magi GM Assistant';
+    const color = CATEGORY_COLORS[envelope.category] || CATEGORY_COLORS.none;
+    let html = `<p><strong style="color:${color}">[${envelope.tag}]</strong> ${envelope.body ?? ''}</p>`;
+
+    // Append image suggestion text when present
+    if (envelope.image) {
+      html += `<p style="color:#888; font-style:italic">📷 Image suggestion: ${envelope.image.description} (${envelope.image.path}) — Type /yes in Discord to post.</p>`;
+    }
 
     try {
       await this.mcp.callTool('foundry__send_whisper', {
         content: html,
-        title,
+        title: 'Magi GM Assistant',
       });
-      logger.info('FoundryAdviceOutput: delivered advice to Foundry');
+      logger.info(`FoundryAdviceOutput: delivered [${envelope.tag}] to Foundry`);
       return true;
     } catch (err) {
       logger.error('FoundryAdviceOutput: failed to deliver:', err);
