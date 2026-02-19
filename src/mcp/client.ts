@@ -6,6 +6,7 @@
 import { EventEmitter } from 'events';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type Anthropic from '@anthropic-ai/sdk';
 import { getConfig } from '../config.js';
 import { logger } from '../logger.js';
@@ -20,7 +21,7 @@ interface McpToolDef {
 interface ServerConnection {
   client: Client;
   tools: McpToolDef[];
-  transport: SSEClientTransport;
+  transport: SSEClientTransport | StreamableHTTPClientTransport;
   url: string;
   required: boolean;
 }
@@ -32,7 +33,7 @@ export interface McpAggregatorEvents {
 export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
   private servers = new Map<string, ServerConnection>();
   private reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private serverConfigs: Array<{ name: string; url: string; token: string; required: boolean }> = [];
+  private serverConfigs: Array<{ name: string; url: string; token: string; required: boolean; transport: 'sse' | 'streamable-http' }> = [];
   private _shuttingDown = false;
   private _cleaningUp = false;
 
@@ -44,17 +45,17 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
     const config = getConfig();
 
     this.serverConfigs = [
-      { name: 'discord', url: config.discordMcpUrl, token: config.discordMcpToken, required: true },
-      { name: 'foundry', url: config.foundryMcpUrl, token: config.foundryMcpToken, required: true },
+      { name: 'discord', url: config.discordMcpUrl, token: config.discordMcpToken, required: true, transport: 'sse' },
+      { name: 'foundry', url: config.foundryMcpUrl, token: config.foundryMcpToken, required: true, transport: 'sse' },
     ];
 
-    // v2: Wiki is required (hard gate)
+    // v2: Wiki is required (hard gate) — uses Streamable HTTP (wiki SSE transport is send-only)
     if (config.wikiMcpUrl) {
-      this.serverConfigs.push({ name: 'wiki', url: config.wikiMcpUrl, token: config.wikiMcpToken, required: true });
+      this.serverConfigs.push({ name: 'wiki', url: config.wikiMcpUrl, token: config.wikiMcpToken, required: true, transport: 'streamable-http' });
     }
 
     const results = await Promise.allSettled(
-      this.serverConfigs.map((conn) => this.connectServer(conn.name, conn.url, conn.token, conn.required))
+      this.serverConfigs.map((conn) => this.connectServer(conn.name, conn.url, conn.token, conn.required, conn.transport))
     );
 
     // Check for required connection failures
@@ -87,20 +88,24 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
     }
   }
 
-  private async connectServer(name: string, baseUrl: string, token: string, required: boolean): Promise<void> {
-    const sseUrl = new URL('/sse', baseUrl);
-    if (token) {
-      sseUrl.searchParams.set('token', token);
-    }
+  private async connectServer(name: string, baseUrl: string, token: string, required: boolean, transportType: 'sse' | 'streamable-http' = 'sse'): Promise<void> {
+    const authHeaders: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
 
-    // Pass auth in both query param (for SSE GET) and requestInit headers (for POST)
-    const transport = new SSEClientTransport(sseUrl, {
-      requestInit: {
-        headers: token
-          ? { Authorization: `Bearer ${token}` }
-          : {},
-      },
-    });
+    let transport: SSEClientTransport | StreamableHTTPClientTransport;
+    if (transportType === 'streamable-http') {
+      const httpUrl = new URL('/mcp', baseUrl);
+      transport = new StreamableHTTPClientTransport(httpUrl, {
+        requestInit: { headers: authHeaders },
+      });
+    } else {
+      const sseUrl = new URL('/sse', baseUrl);
+      if (token) {
+        sseUrl.searchParams.set('token', token);
+      }
+      transport = new SSEClientTransport(sseUrl, {
+        requestInit: { headers: authHeaders },
+      });
+    }
     const client = new Client(
       { name: `magi-gm-${name}`, version: '0.1.0' },
       { capabilities: {} }
@@ -138,7 +143,7 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
       if (this._shuttingDown || this._cleaningUp) return;
       logger.warn(`MCP aggregator: lost connection to '${name}' — scheduling reconnect`);
       this.servers.delete(name);
-      this.scheduleReconnect(name, baseUrl, token, required);
+      this.scheduleReconnect(name, baseUrl, token, required, transportType);
     };
 
     transport.onerror = (err) => {
@@ -148,7 +153,7 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
     };
   }
 
-  private scheduleReconnect(name: string, baseUrl: string, token: string, required: boolean, attempt = 1): void {
+  private scheduleReconnect(name: string, baseUrl: string, token: string, required: boolean, transportType: 'sse' | 'streamable-http' = 'sse', attempt = 1): void {
     if (this._shuttingDown) return;
     if (this.reconnectTimers.has(name)) return; // Already scheduled
 
@@ -159,11 +164,11 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
     const timer = setTimeout(async () => {
       this.reconnectTimers.delete(name);
       try {
-        await this.connectServer(name, baseUrl, token, required);
+        await this.connectServer(name, baseUrl, token, required, transportType);
         logger.info(`MCP aggregator: reconnected to '${name}'`);
       } catch (err) {
         logger.warn(`MCP aggregator: reconnect to '${name}' failed:`, err);
-        this.scheduleReconnect(name, baseUrl, token, required, attempt + 1);
+        this.scheduleReconnect(name, baseUrl, token, required, transportType, attempt + 1);
       }
     }, delay);
 
