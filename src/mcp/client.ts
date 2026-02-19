@@ -46,7 +46,7 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
 
     this.serverConfigs = [
       { name: 'discord', url: config.discordMcpUrl, token: config.discordMcpToken, required: true, transport: 'sse' },
-      { name: 'foundry', url: config.foundryMcpUrl, token: config.foundryMcpToken, required: true, transport: 'sse' },
+      { name: 'foundry', url: config.foundryMcpUrl, token: config.foundryMcpToken, required: false, transport: 'sse' },
     ];
 
     // v2: Wiki is required (hard gate) — uses Streamable HTTP (wiki SSE transport is send-only)
