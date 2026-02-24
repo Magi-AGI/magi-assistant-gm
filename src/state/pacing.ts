@@ -5,7 +5,8 @@ import {
   EngagementLevel,
   SeparationStatus,
   ClimaxProximity,
-  PlantedSeed,
+  ActivationSource,
+  CacheBuildStatus,
 } from '../types/index.js';
 
 /** Creates a fresh pacing state with defaults. */
@@ -26,6 +27,10 @@ export function createInitialPacingState(): PacingState {
     planted_seeds: [],
     open_threads: [],
     assistant_state: AssistantState.PREGAME,
+    activation_source: null,
+    session_end_time: null,
+    npc_cache_status: 'idle',
+    scene_index_status: 'idle',
   };
 }
 
@@ -37,12 +42,23 @@ export function createInitialFreshness(staleThresholdSeconds = 30): FreshnessMet
     foundry_state_ts: null,
     wiki_last_fetch_ts: null,
     state_assembled_at: null,
+    npc_cache_built_at: null,
+    scene_index_built_at: null,
     stale_threshold_seconds: staleThresholdSeconds,
   };
 }
 
+interface PacingSnapshot {
+  state: PacingState;
+  freshness: FreshnessMetadata;
+}
+
+function deepClone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
 /**
- * Manages pacing state lifecycle — timer computation, state transitions,
+ * Manages pacing state lifecycle - timer computation, state transitions,
  * GM command application, and freshness tracking.
  */
 export class PacingStateManager {
@@ -59,7 +75,7 @@ export class PacingStateManager {
   get state(): Readonly<PacingState> { return this._state; }
   get freshness(): Readonly<FreshnessMetadata> { return this._freshness; }
 
-  // ── State Transitions ───────────────────────────────────────────────────
+  // State transitions
 
   get assistantState(): AssistantState { return this._state.assistant_state; }
 
@@ -67,12 +83,31 @@ export class PacingStateManager {
     this._state.assistant_state = newState;
   }
 
+  setActivationSource(source: ActivationSource): void {
+    this._state.activation_source = source;
+  }
+
+  setSessionEndTime(sessionEndTime: string | null): void {
+    this._state.session_end_time = sessionEndTime;
+  }
+
+  setNpcCacheStatus(status: CacheBuildStatus): void {
+    this._state.npc_cache_status = status;
+  }
+
+  setSceneIndexStatus(status: CacheBuildStatus): void {
+    this._state.scene_index_status = status;
+  }
+
   startSession(): void {
     this._state.session_start = new Date().toISOString();
     this._state.assistant_state = AssistantState.PREGAME;
+    this._state.activation_source = null;
+    this._state.npc_cache_status = 'idle';
+    this._state.scene_index_status = 'idle';
   }
 
-  // ── Timer Computation ─────────────────────────────────────────────────
+  // Timer computation
 
   /** Recompute elapsed minutes for act/scene from their started_at timestamps. */
   updateElapsed(now: Date = new Date()): void {
@@ -98,12 +133,12 @@ export class PacingStateManager {
     return this._sceneOverrunFired.has(this._state.current_scene);
   }
 
-  /** Mark that P3 overrun has fired for the current scene (don't repeat). */
+  /** Mark that P3 overrun has fired for the current scene (do not repeat). */
   markOverrunFired(): void {
     this._sceneOverrunFired.add(this._state.current_scene);
   }
 
-  // ── Scene / Act Advancement ───────────────────────────────────────────
+  // Scene / Act advancement
 
   advanceScene(sceneName: string, plannedMinutes = 0): void {
     const now = new Date().toISOString();
@@ -113,7 +148,7 @@ export class PacingStateManager {
       planned_max_minutes: plannedMinutes,
       elapsed_minutes: 0,
     };
-    // Allow P3 to re-fire if GM revisits a scene (e.g. A1→A2→A1)
+    // Allow P3 to re-fire if GM revisits a scene (e.g. A1->A2->A1)
     this._sceneOverrunFired.delete(sceneName);
   }
 
@@ -137,11 +172,10 @@ export class PacingStateManager {
     this._state.next_planned_beat = beat;
   }
 
-  // ── Spotlight / Engagement ────────────────────────────────────────────
+  // Spotlight / engagement
 
   setSpotlight(player: string, debt: number): void {
     this._state.spotlight_debt[player] = debt;
-    // Recalculate which players lack recent spotlight
     this._state.players_without_recent_spotlight = Object.entries(this._state.spotlight_debt)
       .filter(([, d]) => d > 0)
       .map(([name]) => name);
@@ -159,14 +193,14 @@ export class PacingStateManager {
     this._state.climax_proximity = proximity;
   }
 
-  // ── Seeds / Threads ───────────────────────────────────────────────────
+  // Seeds / threads
 
   addSeed(name: string, scene: string): void {
     this._state.planted_seeds.push({ name, planted_in_scene: scene, revealed: false });
   }
 
   revealSeed(name: string): void {
-    const seed = this._state.planted_seeds.find(s => s.name === name);
+    const seed = this._state.planted_seeds.find((entry) => entry.name === name);
     if (seed) seed.revealed = true;
   }
 
@@ -177,10 +211,10 @@ export class PacingStateManager {
   }
 
   closeThread(thread: string): void {
-    this._state.open_threads = this._state.open_threads.filter(t => t !== thread);
+    this._state.open_threads = this._state.open_threads.filter((entry) => entry !== thread);
   }
 
-  // ── Freshness ─────────────────────────────────────────────────────────
+  // Freshness
 
   updateTranscriptFreshness(cursor: number, latestTs: string): void {
     this._freshness.transcript_cursor = cursor;
@@ -193,6 +227,14 @@ export class PacingStateManager {
 
   updateWikiFreshness(ts: string): void {
     this._freshness.wiki_last_fetch_ts = ts;
+  }
+
+  markNpcCacheBuilt(ts: string = new Date().toISOString()): void {
+    this._freshness.npc_cache_built_at = ts;
+  }
+
+  markSceneIndexBuilt(ts: string = new Date().toISOString()): void {
+    this._freshness.scene_index_built_at = ts;
   }
 
   markAssembled(): void {
@@ -211,11 +253,24 @@ export class PacingStateManager {
     const stale: string[] = [];
     if (this.isStale(this._freshness.transcript_latest_ts, now)) stale.push('transcript');
     if (this.isStale(this._freshness.foundry_state_ts, now)) stale.push('foundry');
-    // Wiki staleness is less critical — only warn if it's been a very long time
     return stale;
   }
 
-  // ── Reset ─────────────────────────────────────────────────────────────
+  // Persistence snapshots
+
+  snapshot(): PacingSnapshot {
+    return {
+      state: deepClone(this._state),
+      freshness: deepClone(this._freshness),
+    };
+  }
+
+  restore(snapshot: PacingSnapshot): void {
+    this._state = deepClone(snapshot.state);
+    this._freshness = deepClone(snapshot.freshness);
+  }
+
+  // Reset
 
   reset(): void {
     this._state = createInitialPacingState();

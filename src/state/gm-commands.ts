@@ -10,6 +10,7 @@ const COMMAND_PATTERN = /^\/(\w+)\s*(.*)/;
 const VALID_COMMANDS: ReadonlySet<string> = new Set<GmCommandType>([
   'act', 'scene', 'spotlight', 'engagement',
   'separation', 'climax', 'seed', 'sleep', 'wake',
+  'endtime', 'npc',
 ]);
 
 /**

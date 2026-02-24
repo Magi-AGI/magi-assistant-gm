@@ -9,14 +9,15 @@ import type { AdviceEnvelope, AdviceCategory } from '../types/index.js';
 
 /** Category → HTML color for the tag prefix. */
 const CATEGORY_COLORS: Record<AdviceCategory, string> = {
-  script: '#4a9eff',     // blue
-  pacing: '#ff9800',     // orange
-  continuity: '#9c27b0', // purple
-  spotlight: '#4caf50',  // green
-  mechanics: '#795548',  // brown
-  technical: '#607d8b',  // grey
-  creative: '#e91e63',   // pink
-  none: '#9e9e9e',       // grey
+  script: '#4a9eff',       // blue
+  'gap-fill': '#00bcd4',   // cyan — fast, urgent, distinct from script blue
+  pacing: '#ff9800',       // orange
+  continuity: '#9c27b0',   // purple
+  spotlight: '#4caf50',    // green
+  mechanics: '#795548',    // brown
+  technical: '#607d8b',    // grey
+  creative: '#e91e63',     // pink
+  none: '#9e9e9e',         // grey
 };
 
 export class FoundryAdviceOutput {
