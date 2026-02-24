@@ -1,12 +1,14 @@
 /**
- * Magi GM Assistant v2 — Event-driven orchestrator.
+ * Magi GM Assistant v3 — Event-driven orchestrator.
  *
- * Replaces v1 dual polling loops + heartbeat with:
- * - P1-P4 priority triggers
- * - PREGAME/ACTIVE/SLEEP state machine
- * - Wiki hard gate
- * - Image queue integration
- * - GM command parsing from Foundry chat
+ * v2 base: P1-P4 priority triggers, PREGAME/ACTIVE/SLEEP state machine,
+ * wiki hard gate, image queue, GM command parsing.
+ *
+ * v3 additions:
+ * - Auto-ACTIVE: transcript-based PREGAME→ACTIVE fallback
+ * - ACTIVE initialization: NPC pre-cache + scene index build (async, non-blocking)
+ * - Pacing gates: convergence/denouement triggers on wall-clock time
+ * - GM commands: /endtime, /npc refresh, /npc serve
  */
 
 import { config as dotenvConfig } from 'dotenv';
@@ -17,12 +19,15 @@ import { logger } from './logger.js';
 import { McpAggregator } from './mcp/client.js';
 import { PacingStateManager } from './state/pacing.js';
 import { AdviceMemoryBuffer } from './state/advice-memory.js';
-import { TriggerDetector } from './reasoning/triggers.js';
+import { TriggerDetector, loadFuzzyMatchTable } from './reasoning/triggers.js';
 import { ReasoningEngine } from './reasoning/engine.js';
+import { NpcCacheBuilder } from './reasoning/npc-cache.js';
+import { SceneIndexBuilder } from './reasoning/scene-index.js';
 import { AdviceDelivery } from './output/index.js';
 import { ImageQueue } from './output/image-queue.js';
 import { parseGmCommand } from './state/gm-commands.js';
 import { AssistantState } from './types/index.js';
+import type { ActivationSource, NpcCacheEntry, SceneIndexEntry } from './types/index.js';
 
 const config = getConfig();
 
@@ -36,6 +41,11 @@ const imageQueue = new ImageQueue();
 let triggers: TriggerDetector | null = null;
 let engine: ReasoningEngine | null = null;
 let delivery: AdviceDelivery | null = null;
+
+// v3: Cache state
+let npcCache: NpcCacheEntry[] = [];
+let sceneIndex: SceneIndexEntry[] = [];
+let activationBuildInProgress = false;
 
 // ── Polling state ──────────────────────────────────────────────────────────
 
@@ -102,6 +112,142 @@ process.on('uncaughtException', (err) => {
   logger.error('Uncaught exception:', err);
   gracefulShutdown('uncaughtException');
 });
+
+// ── v3: ACTIVE Initialization ─────────────────────────────────────────────
+
+/**
+ * Handle transition to ACTIVE state from any source.
+ * Centralizes state transition + async cache build so all activation paths
+ * (Foundry scene change, /scene command, /act command, auto-ACTIVE)
+ * go through one function.
+ */
+async function handleActivation(source: ActivationSource): Promise<void> {
+  const prevState = pacing.assistantState;
+  if (prevState !== AssistantState.PREGAME) {
+    if (prevState === AssistantState.SLEEP) {
+      pacing.transitionTo(AssistantState.ACTIVE);
+      pacing.setActivationSource(source);
+      logger.info(`Orchestrator: SLEEP → ACTIVE (${source})`);
+    }
+    // If caches failed or were never built, rebuild them
+    const cacheMissing = npcCache.length === 0 && sceneIndex.length === 0;
+    const cacheError = pacing.state.npc_cache_status === 'error' || pacing.state.scene_index_status === 'error';
+    if ((cacheMissing || cacheError) && config.campaignWikiCard && !activationBuildInProgress) {
+      logger.info('Orchestrator: rebuilding caches (missing or errored)');
+      activationBuildInProgress = true;
+      buildActivationCaches(config.campaignWikiCard).catch(err => {
+        logger.error('Orchestrator: activation cache rebuild failed:', err);
+      }).finally(() => {
+        activationBuildInProgress = false;
+      });
+    }
+    return;
+  }
+
+  // PREGAME → ACTIVE
+  pacing.transitionTo(AssistantState.ACTIVE);
+  pacing.setActivationSource(source);
+  logger.info(`Orchestrator: PREGAME → ACTIVE (${source})`);
+
+  // Set session end time from config if available
+  if (config.sessionEndTime) {
+    const endTime = parseSessionEndTime(config.sessionEndTime);
+    if (endTime) {
+      pacing.setSessionEndTime(endTime);
+      logger.info(`Orchestrator: session end time set to ${endTime}`);
+    }
+  }
+
+  // Kick off async cache build (non-blocking — P1 triggers still work during build)
+  if (config.campaignWikiCard && !activationBuildInProgress) {
+    activationBuildInProgress = true;
+    buildActivationCaches(config.campaignWikiCard).catch(err => {
+      logger.error('Orchestrator: activation cache build failed:', err);
+    }).finally(() => {
+      activationBuildInProgress = false;
+    });
+  }
+}
+
+/**
+ * Build NPC pre-cache and scene index from the episode plan.
+ * Called asynchronously on ACTIVE transition.
+ */
+async function buildActivationCaches(episodePlanCard: string): Promise<void> {
+  logger.info('Orchestrator: building NPC cache and scene index...');
+
+  pacing.setNpcCacheStatus('building');
+  pacing.setSceneIndexStatus('building');
+
+  // Build both in parallel
+  const [npcResult, sceneResult] = await Promise.allSettled([
+    new NpcCacheBuilder(mcp, config.npcCacheMaxBriefWords).build(episodePlanCard),
+    new SceneIndexBuilder(mcp, config.autoActiveMinTermLength).build(episodePlanCard),
+  ]);
+
+  // Apply NPC cache
+  if (npcResult.status === 'fulfilled') {
+    npcCache = npcResult.value;
+    pacing.setNpcCacheStatus('ready');
+    pacing.markNpcCacheBuilt();
+    if (triggers) {
+      triggers.setNpcCache(npcCache);
+      // Backfill: scan recent transcript for NPC mentions that arrived
+      // during the async cache build window.
+      const recentSegments = transcriptCache.map(s => ({
+        text: s.text,
+        timestamp: s.timestamp,
+      }));
+      triggers.backfillNpcMentions(recentSegments);
+    }
+    logger.info(`Orchestrator: NPC cache ready (${npcCache.length} entries)`);
+  } else {
+    pacing.setNpcCacheStatus('error');
+    logger.error('Orchestrator: NPC cache build failed:', npcResult.reason);
+  }
+
+  // Apply scene index
+  if (sceneResult.status === 'fulfilled') {
+    sceneIndex = sceneResult.value;
+    pacing.setSceneIndexStatus('ready');
+    pacing.markSceneIndexBuilt();
+    if (triggers) triggers.setSceneIndex(sceneIndex);
+    logger.info(`Orchestrator: scene index ready (${sceneIndex.length} entries)`);
+  } else {
+    pacing.setSceneIndexStatus('error');
+    logger.error('Orchestrator: scene index build failed:', sceneResult.reason);
+  }
+}
+
+/**
+ * Parse a session end time string into ISO 8601.
+ * Accepts ISO 8601, "HH:MM", or "H:MM" (interpreted as today or tomorrow).
+ */
+function parseSessionEndTime(raw: string): string | null {
+  // Try ISO 8601 first
+  const isoDate = new Date(raw);
+  if (!isNaN(isoDate.getTime()) && raw.includes('-')) {
+    return isoDate.toISOString();
+  }
+
+  // Try HH:MM format
+  const timeMatch = raw.match(/^(\d{1,2}):(\d{2})$/);
+  if (timeMatch) {
+    const hours = parseInt(timeMatch[1], 10);
+    const minutes = parseInt(timeMatch[2], 10);
+    const now = new Date();
+    const target = new Date(now);
+    target.setHours(hours, minutes, 0, 0);
+    // If the target time is in the past, assume tomorrow
+    if (target.getTime() <= now.getTime()) {
+      target.setDate(target.getDate() + 1);
+    }
+    return target.toISOString();
+  }
+
+  logger.warn(`Orchestrator: could not parse SESSION_END_TIME "${raw}"`);
+  return null;
+}
 
 // ── Transcript polling ─────────────────────────────────────────────────────
 
@@ -191,7 +337,6 @@ async function pollTranscript(): Promise<void> {
     }
 
     // Apply in-place updates and re-feed newly-finalized segments to triggers
-    // Fix #4: interim→final updates must be detected for P1/P2 keywords
     const newlyFinalized: typeof rawSegments = [];
     for (const updated of updatedSegments) {
       const idx = transcriptCache.findIndex(c => c.rowId === updated.id);
@@ -200,7 +345,6 @@ async function pollTranscript(): Promise<void> {
         if (updated.displayName) {
           transcriptCache[idx].displayName = updated.displayName;
         }
-        // If this segment just became final, it needs trigger detection
         if (updated.isFinal) {
           newlyFinalized.push(updated);
         }
@@ -241,13 +385,10 @@ async function pollTranscript(): Promise<void> {
         transcriptCache.splice(0, transcriptCache.length - TRANSCRIPT_CACHE_SIZE);
       }
 
-      // Fix #6: Skip trigger feeding on the first poll after a session change
-      // to avoid replaying historical transcript into trigger detection.
       if (sessionJustChanged) {
         sessionJustChanged = false;
         logger.info(`Transcript poll: seeded ${mapped.length} historical segments (triggers skipped)`);
       } else {
-        // Feed only FINAL segments to trigger detector (per config)
         const finalOnly = config.finalSegmentsOnly;
         const toDetect = finalOnly
           ? newSegments.filter(s => s.isFinal)
@@ -265,8 +406,7 @@ async function pollTranscript(): Promise<void> {
         }
       }
     }
-    // Always poll text events to keep cursor current (prevents stale /yes replay).
-    // Only act on /yes /no when an image is actually pending.
+    // Text events polling (image queue /yes /no)
     if (lastSessionId) {
       try {
         const textRaw = await mcp.readResource('discord', `session://${lastSessionId}/text-events`);
@@ -282,10 +422,6 @@ async function pollTranscript(): Promise<void> {
             lastTextEventId = evtId;
 
             if (evt.eventType !== 'create') continue;
-            // Auth note: /yes and /no slash commands are already gated by the
-            // Discord bot (GM role check + session text channel restriction).
-            // GM_IDENTIFIER is for speech identity (diarization labels), not
-            // Discord user IDs, so we don't duplicate the check here.
             const content = evt.content?.trim().toLowerCase();
             if (content === '/yes' && imageQueue.hasPending()) {
               const suggestion = imageQueue.confirm();
@@ -362,7 +498,6 @@ async function pollGameState(): Promise<void> {
         if (lastIdx >= 0) {
           const newMessages = chat.slice(lastIdx + 1);
           for (const msg of newMessages) {
-            // Only accept GM commands from GM-authored messages (strict check)
             if (msg.content && msg.isGm === true) {
               const cmd = parseGmCommand(msg.content, msg.timestamp ?? new Date().toISOString());
               if (cmd) {
@@ -393,13 +528,12 @@ function applyGmCommand(cmd: import('./types/index.js').GmCommand): void {
       if (Number.isFinite(actNum)) {
         pacing.advanceAct(actNum, planned);
         if (pacing.assistantState === AssistantState.PREGAME) {
-          pacing.transitionTo(AssistantState.ACTIVE);
+          handleActivation('command');
         }
       }
       break;
     }
     case 'scene': {
-      // Fix #7: If the last arg is a number, treat it as planned minutes, not part of the name
       let sceneName: string;
       let planned = 0;
       const lastArg = cmd.args[cmd.args.length - 1];
@@ -411,7 +545,7 @@ function applyGmCommand(cmd: import('./types/index.js').GmCommand): void {
       }
       pacing.advanceScene(sceneName, planned);
       if (pacing.assistantState === AssistantState.PREGAME) {
-        pacing.transitionTo(AssistantState.ACTIVE);
+        handleActivation('command');
       }
       break;
     }
@@ -447,16 +581,46 @@ function applyGmCommand(cmd: import('./types/index.js').GmCommand): void {
       logger.info('GM command: ACTIVE → SLEEP');
       break;
     case 'wake':
-      pacing.transitionTo(AssistantState.ACTIVE);
+      handleActivation('command');
       logger.info('GM command: → ACTIVE');
       break;
+
+    // v3 commands
+    case 'endtime': {
+      const timeStr = cmd.args.join(' ');
+      if (timeStr) {
+        const endTime = parseSessionEndTime(timeStr);
+        if (endTime) {
+          pacing.setSessionEndTime(endTime);
+          logger.info(`GM command: session end time set to ${endTime}`);
+        }
+      }
+      break;
+    }
+    case 'npc': {
+      const subcommand = cmd.args[0]?.toLowerCase();
+      if (subcommand === 'refresh' && config.campaignWikiCard) {
+        logger.info('GM command: forcing NPC cache rebuild');
+        buildActivationCaches(config.campaignWikiCard);
+      } else if (subcommand === 'serve') {
+        const npcName = cmd.args.slice(1).join(' ').toLowerCase();
+        const npc = npcCache.find(n => n.key === npcName || n.aliases.includes(npcName));
+        if (npc) {
+          npc.served = false; // Reset served flag so trigger detector will serve it
+          logger.info(`GM command: marking ${npc.display_name} for re-serve`);
+        } else {
+          logger.warn(`GM command: NPC "${npcName}" not found in cache`);
+        }
+      }
+      break;
+    }
   }
 }
 
 // ── Startup ────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  logger.info('Magi GM Assistant v2 starting...');
+  logger.info('Magi GM Assistant v3 starting...');
   logger.info(`  Model: ${config.anthropicModel}`);
   logger.info(`  Discord MCP: ${config.discordMcpUrl}`);
   logger.info(`  Foundry MCP: ${config.foundryMcpUrl}`);
@@ -464,12 +628,10 @@ async function main(): Promise<void> {
 
   // ── Step 1: Validate wiki URL ──────────────────────────────────────────
   if (!config.wikiMcpUrl) {
-    throw new Error('WIKI_MCP_URL is required in v2. Cannot start without wiki access.');
+    throw new Error('WIKI_MCP_URL is required. Cannot start without wiki access.');
   }
 
   // ── Step 2+3: Connect and health-check all MCP servers (with retry) ──
-  // Both connect and health check are covered by the retry loop, so
-  // transient wiki outages at startup don't cause immediate failure.
   const STARTUP_RETRIES = 3;
   const STARTUP_BACKOFF_BASE_MS = 2000;
   let wikiHealthy = false;
@@ -527,6 +689,20 @@ async function main(): Promise<void> {
     logger.warn('  CAMPAIGN_WIKI_CARD not set — assistant will run without episode plan knowledge.');
   }
 
+  // ── Step 3c: v3 — Load fuzzy match table ─────────────────────────────
+  const fuzzyTable = loadFuzzyMatchTable(config.sttFuzzyMatchPath);
+
+  // ── Step 3d: v3 — Log configuration warnings ────────────────────────
+  if (!config.gmIdentifier) {
+    logger.warn('  GM_IDENTIFIER not set — silence detection and hesitation detection will track all speakers.');
+  }
+  if (!config.sessionEndTime) {
+    logger.warn('  SESSION_END_TIME not set — pacing gates (convergence/denouement) are disabled. Set via /endtime HH:MM during session.');
+  }
+  if (config.autoActiveEnabled && Object.keys(fuzzyTable).length === 0) {
+    logger.warn('  Auto-ACTIVE enabled but fuzzy match table is empty — transcript-based activation may not work. Check STT_FUZZY_MATCH_PATH.');
+  }
+
   // ── Step 4: Initialize state ──────────────────────────────────────────
   pacing.startSession();
   memory.clear();
@@ -536,13 +712,18 @@ async function main(): Promise<void> {
   engine = new ReasoningEngine(mcp, pacing, memory, () => [...transcriptCache]);
   delivery = new AdviceDelivery(mcp);
 
-  triggers = new TriggerDetector(pacing);
+  triggers = new TriggerDetector(pacing, fuzzyTable);
+
+  // v3: Listen for activation events from trigger detector
+  triggers.on('activated', (source: ActivationSource) => {
+    handleActivation(source);
+  });
+
   triggers.on('trigger', async (batch) => {
     if (!engine || !delivery) return;
 
     const envelope = await engine.process(batch);
     if (envelope) {
-      // Queue image suggestion if present
       if (envelope.image) {
         imageQueue.setPending(envelope.image);
       }
@@ -569,7 +750,7 @@ async function main(): Promise<void> {
     pollTranscript().catch(err => logger.debug('Transcript poll error:', err));
   }, 10_000);
 
-  // Game state: 10s (fallback — SSE preferred if supported)
+  // Game state: 10s
   gameStatePollTimer = setInterval(() => {
     pollGameState().catch(err => logger.debug('Game state poll error:', err));
   }, 10_000);
@@ -582,7 +763,7 @@ async function main(): Promise<void> {
     }
   }, 30_000);
 
-  logger.info('GM Assistant v2 ready — monitoring for triggers (PREGAME)');
+  logger.info('GM Assistant v3 ready — monitoring for triggers (PREGAME)');
 }
 
 main().catch((err) => {
