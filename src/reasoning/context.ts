@@ -110,50 +110,6 @@ export class ContextAssembler {
     }
   }
 
-  /**
-   * v3: Pre-fetch scene and NPC cards referenced by trigger events.
-   * Returns context blocks to inject, saving Claude tool-use iterations.
-   */
-  private async prefetchTriggerCards(batch: TriggerBatch): Promise<{ sceneCardBlock: string; npcCardBlock: string }> {
-    let sceneCardBlock = '';
-    let npcCardBlock = '';
-
-    // Collect card paths to pre-fetch
-    const sceneEvent = batch.events.find(e => e.type === 'scene_transition_detected');
-    const npcEvent = batch.events.find(e => e.type === 'npc_first_appearance');
-
-    const sceneCardPath = sceneEvent?.data.scene_card as string | undefined;
-    const npcCardPath = npcEvent?.data.npc_card as string | undefined;
-
-    if (!sceneCardPath && !npcCardPath) return { sceneCardBlock, npcCardBlock };
-
-    // Fetch in parallel
-    const [sceneResult, npcResult] = await Promise.allSettled([
-      sceneCardPath ? this.fetchWikiCard(sceneCardPath) : Promise.resolve(null),
-      npcCardPath ? this.fetchWikiCard(npcCardPath) : Promise.resolve(null),
-    ]);
-
-    if (sceneResult.status === 'fulfilled' && sceneResult.value) {
-      const title = sceneEvent!.data.scene_title as string;
-      sceneCardBlock = this.truncateToTokens(
-        `Scene: ${title}\n\n${sceneResult.value}`,
-        BUDGET_SCENE_CARD,
-      );
-      logger.info(`ContextAssembler: pre-fetched scene card "${sceneCardPath}" (~${estimateTokens(sceneCardBlock)} tokens)`);
-    }
-
-    if (npcResult.status === 'fulfilled' && npcResult.value) {
-      const name = npcEvent!.data.npc_name as string;
-      npcCardBlock = this.truncateToTokens(
-        `NPC: ${name}\n\n${npcResult.value}`,
-        BUDGET_NPC_CARD,
-      );
-      logger.info(`ContextAssembler: pre-fetched NPC card "${npcCardPath}" (~${estimateTokens(npcCardBlock)} tokens)`);
-    }
-
-    return { sceneCardBlock, npcCardBlock };
-  }
-
   /** Load the system prompt template from disk. */
   loadTemplate(): void {
     const config = getConfig();
@@ -177,16 +133,38 @@ export class ContextAssembler {
     const config = getConfig();
     const maxTokens = config.maxContextTokens;
 
-    // ── Parallel MCP fetches ────────────────────────────────────────────
-    const [gameStateRaw, episodePlanRaw] = await Promise.allSettled([
+    // ── Parallel MCP fetches (game state, episode plan, trigger cards) ──
+    // All MCP fetches run in a single Promise.allSettled to minimize latency.
+    const sceneEvent = batch.events.find(e => e.type === 'scene_transition_detected');
+    const npcEvent = batch.events.find(e => e.type === 'npc_first_appearance');
+    const sceneCardPath = sceneEvent?.data.scene_card as string | undefined;
+    const npcCardPath = npcEvent?.data.npc_card as string | undefined;
+
+    const [gameStateRaw, episodePlanRaw, sceneCardRaw, npcCardRaw] = await Promise.allSettled([
       this.mcp.readResource('foundry', 'game://state'),
       config.campaignWikiCard && this.mcp.isConnected('wiki')
         ? this.mcp.readResource('wiki', `card://${config.campaignWikiCard}`)
         : Promise.resolve(''),
+      sceneCardPath ? this.fetchWikiCard(sceneCardPath) : Promise.resolve(null),
+      npcCardPath ? this.fetchWikiCard(npcCardPath) : Promise.resolve(null),
     ]);
 
     let gameState = gameStateRaw.status === 'fulfilled' ? gameStateRaw.value : '{}';
     const episodePlan = episodePlanRaw.status === 'fulfilled' ? episodePlanRaw.value : '';
+
+    // Build pre-fetched card blocks
+    let sceneCardBlock = '';
+    if (sceneCardRaw.status === 'fulfilled' && sceneCardRaw.value) {
+      const title = sceneEvent!.data.scene_title as string;
+      sceneCardBlock = this.truncateToTokens(`Scene: ${title}\n\n${sceneCardRaw.value}`, BUDGET_SCENE_CARD);
+      logger.info(`ContextAssembler: pre-fetched scene card "${sceneCardPath}" (~${estimateTokens(sceneCardBlock)} tokens)`);
+    }
+    let npcCardBlock = '';
+    if (npcCardRaw.status === 'fulfilled' && npcCardRaw.value) {
+      const name = npcEvent!.data.npc_name as string;
+      npcCardBlock = this.truncateToTokens(`NPC: ${name}\n\n${npcCardRaw.value}`, BUDGET_NPC_CARD);
+      logger.info(`ContextAssembler: pre-fetched NPC card "${npcCardPath}" (~${estimateTokens(npcCardBlock)} tokens)`);
+    }
 
     // Check Foundry connectivity
     try {
@@ -208,7 +186,7 @@ export class ContextAssembler {
     // ── Build components ────────────────────────────────────────────────
 
     const systemPrompt = this.systemPromptTemplate;
-    const triggerSummary = this.summarizeTriggers(batch);
+    const triggerSummary = this.summarizeTriggers(batch, { sceneCardFetched: !!sceneCardBlock, npcCardFetched: !!npcCardBlock });
     const pacingBlock = this.buildPacingBlock();
     const rosterBlock = this.buildCompressedRoster(gameState);
     const episodeBlock = this.truncateToTokens(this.stripHtml(episodePlan || 'No episode plan loaded.'), BUDGET_EPISODE_PLAN);
@@ -216,9 +194,6 @@ export class ContextAssembler {
     const advisedBlock = this.buildAlreadyAdvisedBlock();
     const freshnessBlock = this.buildFreshnessWarnings();
     const mappingsText = this.buildMappingsText();
-
-    // v3/v4: Pre-fetch scene/NPC cards referenced by trigger events
-    const { sceneCardBlock, npcCardBlock } = await this.prefetchTriggerCards(batch);
 
     // ── Tool definitions (computed early — needed for budget) ──────────
 
@@ -437,8 +412,20 @@ export class ContextAssembler {
 
   // ── Helpers ─────────────────────────────────────────────────────────────
 
-  private stripHtml(text: string): string {
-    return text.replace(/<[^>]*>/g, '');
+  /** Strip HTML tags while preserving paragraph/list structure. */
+  private stripHtml(html: string): string {
+    return html
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/(?:p|div|li|tr|h[1-6])>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&nbsp;/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
   }
 
   private truncateToTokens(text: string, maxTokens: number): string {
@@ -448,7 +435,10 @@ export class ContextAssembler {
     return text.slice(0, maxChars) + '\n...[truncated]';
   }
 
-  private summarizeTriggers(batch: TriggerBatch): string {
+  private summarizeTriggers(
+    batch: TriggerBatch,
+    prefetch: { sceneCardFetched: boolean; npcCardFetched: boolean } = { sceneCardFetched: false, npcCardFetched: false },
+  ): string {
     if (batch.events.length === 0) return 'No specific triggers.';
 
     const parts: string[] = [];
@@ -470,7 +460,9 @@ export class ContextAssembler {
           parts.push(
             `P2 — Scene detected from keywords: "${event.data.scene_title}" ` +
             `(matched: ${(event.data.matched_keywords as string[])?.join(', ') ?? ''}). ` +
-            `The scene card has been pre-fetched below — use it for read-aloud text, objectives, and setup notes.`
+            (prefetch.sceneCardFetched
+              ? `The scene card has been pre-fetched below — use it for read-aloud text, objectives, and setup notes.`
+              : `Use wiki__get_card to fetch "${event.data.scene_card}" for read-aloud text, objectives, and setup notes.`)
           );
           break;
         case 'npc_first_appearance': {
@@ -478,7 +470,9 @@ export class ContextAssembler {
           parts.push(
             `P2 — NPC first appearance: ${event.data.npc_name}${pron}. ` +
             `Brief: ${event.data.npc_brief}. ` +
-            `Full character card has been pre-fetched below.`
+            (prefetch.npcCardFetched
+              ? `Full character card has been pre-fetched below.`
+              : `Use wiki__get_card to fetch "${event.data.npc_card}" for full character details.`)
           );
           break;
         }

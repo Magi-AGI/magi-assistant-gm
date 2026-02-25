@@ -87,7 +87,7 @@ You MUST respond with a single JSON object (no markdown fencing, no preamble):
   "tag": "SHORT_TAG",
   "priority": 1-4,
   "summary": "<=15 word summary",
-  "body": "Full advice text (<=100 words) or null for NO_ADVICE",
+  "body": "Full advice text or null for NO_ADVICE (see word limits above)",
   "confidence": 0.0-1.0,
   "source_cards": ["wiki card names referenced"],
   "image": { "path": "relative/path.webp", "description": "what it shows", "post_to": "channel" } | null
