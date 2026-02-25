@@ -1,6 +1,7 @@
 /**
- * v2 Context assembler — 15k token budget (configurable) with freshness tracking,
- * compressed roster, pacing state, and ALREADY ADVISED injection.
+ * v3 Context assembler — configurable token budget with freshness tracking,
+ * compressed roster, pacing state, ALREADY ADVISED injection,
+ * and trigger-driven scene/NPC card pre-fetch.
  */
 
 import * as fs from 'fs';
@@ -38,7 +39,39 @@ const BUDGET_EPISODE_PLAN = 1500;
 const BUDGET_ROSTER = 1500;
 const BUDGET_ALREADY_ADVISED = 1500;
 const BUDGET_NPC_CACHE = 500;
+const BUDGET_SCENE_CARD = 1500;
+const BUDGET_NPC_CARD = 800;
 const BUDGET_RESPONSE_RESERVE = 2000;
+
+// ── MCP result extraction ─────────────────────────────────────────────────
+
+/** Extract text content from an MCP callTool result. */
+function extractMcpText(result: unknown): string | null {
+  if (!result || typeof result !== 'object') return null;
+  const r = result as Record<string, unknown>;
+  if (Array.isArray(r.content)) {
+    for (const item of r.content) {
+      if (item && typeof item === 'object' && (item as Record<string, unknown>).type === 'text') {
+        const text = (item as Record<string, unknown>).text;
+        if (typeof text === 'string') return text;
+      }
+    }
+  }
+  return null;
+}
+
+/** Extract HTML from a wiki get_card result (handles JSON envelope). */
+function extractCardHtml(result: unknown): string | null {
+  const text = extractMcpText(result);
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed === 'object' && parsed !== null && typeof parsed.text === 'string') {
+      return parsed.text;
+    }
+  } catch { /* not JSON — raw HTML */ }
+  return text;
+}
 
 export class ContextAssembler {
   private systemPromptTemplate: string = '';
@@ -57,6 +90,68 @@ export class ContextAssembler {
 
   setSceneIndex(index: SceneIndexEntry[]): void {
     this.sceneIndex = index;
+  }
+
+  /**
+   * Fetch a wiki card's text content via MCP. Returns stripped HTML or null.
+   * Non-throwing: logs and returns null on failure.
+   */
+  private async fetchWikiCard(cardPath: string): Promise<string | null> {
+    try {
+      const result = await this.mcp.callTool('wiki__get_card', {
+        name: cardPath,
+        max_content_length: 8000,
+      });
+      const html = extractCardHtml(result);
+      return html ? this.stripHtml(html) : null;
+    } catch (err) {
+      logger.warn(`ContextAssembler: failed to fetch wiki card "${cardPath}":`, err);
+      return null;
+    }
+  }
+
+  /**
+   * v3: Pre-fetch scene and NPC cards referenced by trigger events.
+   * Returns context blocks to inject, saving Claude tool-use iterations.
+   */
+  private async prefetchTriggerCards(batch: TriggerBatch): Promise<{ sceneCardBlock: string; npcCardBlock: string }> {
+    let sceneCardBlock = '';
+    let npcCardBlock = '';
+
+    // Collect card paths to pre-fetch
+    const sceneEvent = batch.events.find(e => e.type === 'scene_transition_detected');
+    const npcEvent = batch.events.find(e => e.type === 'npc_first_appearance');
+
+    const sceneCardPath = sceneEvent?.data.scene_card as string | undefined;
+    const npcCardPath = npcEvent?.data.npc_card as string | undefined;
+
+    if (!sceneCardPath && !npcCardPath) return { sceneCardBlock, npcCardBlock };
+
+    // Fetch in parallel
+    const [sceneResult, npcResult] = await Promise.allSettled([
+      sceneCardPath ? this.fetchWikiCard(sceneCardPath) : Promise.resolve(null),
+      npcCardPath ? this.fetchWikiCard(npcCardPath) : Promise.resolve(null),
+    ]);
+
+    if (sceneResult.status === 'fulfilled' && sceneResult.value) {
+      const title = sceneEvent!.data.scene_title as string;
+      sceneCardBlock = this.truncateToTokens(
+        `Scene: ${title}\n\n${sceneResult.value}`,
+        BUDGET_SCENE_CARD,
+      );
+      logger.info(`ContextAssembler: pre-fetched scene card "${sceneCardPath}" (~${estimateTokens(sceneCardBlock)} tokens)`);
+    }
+
+    if (npcResult.status === 'fulfilled' && npcResult.value) {
+      const name = npcEvent!.data.npc_name as string;
+      npcCardBlock = this.truncateToTokens(
+        `NPC: ${name}\n\n${npcResult.value}`,
+        BUDGET_NPC_CARD,
+      );
+      logger.info(`ContextAssembler: pre-fetched NPC card "${npcCardPath}" (~${estimateTokens(npcCardBlock)} tokens)`);
+    }
+
+    return { sceneCardBlock, npcCardBlock };
   }
 
   /** Load the system prompt template from disk. */
@@ -122,6 +217,9 @@ export class ContextAssembler {
     const freshnessBlock = this.buildFreshnessWarnings();
     const mappingsText = this.buildMappingsText();
 
+    // v3/v4: Pre-fetch scene/NPC cards referenced by trigger events
+    const { sceneCardBlock, npcCardBlock } = await this.prefetchTriggerCards(batch);
+
     // ── Tool definitions (computed early — needed for budget) ──────────
 
     // Filter out tools that Claude must not call directly (image posting requires GM confirmation)
@@ -140,6 +238,8 @@ export class ContextAssembler {
       estimateTokens(rosterBlock) +
       estimateTokens(episodeBlock) +
       estimateTokens(npcBlock) +
+      estimateTokens(sceneCardBlock) +
+      estimateTokens(npcCardBlock) +
       estimateTokens(advisedBlock) +
       estimateTokens(freshnessBlock) +
       estimateTokens(mappingsText) +
@@ -170,6 +270,8 @@ export class ContextAssembler {
       freshnessBlock ? `## Data Freshness\n${freshnessBlock}` : '',
       `## Pacing State\n${pacingBlock}`,
       `## Episode Plan (Current Act)\n${episodeBlock}`,
+      sceneCardBlock ? `## Pre-Fetched Scene Card\nFull content from the matched scene card. Use this for read-aloud text, objectives, and setup notes.\n\n${sceneCardBlock}` : '',
+      npcCardBlock ? `## Pre-Fetched NPC Card\nFull character card for the NPC just mentioned. Use this for voice, personality, and relationships.\n\n${npcCardBlock}` : '',
       `## Character Roster\n${rosterBlock}`,
       npcBlock ? `## NPC Reference (Pre-Cached)\n${npcBlock}` : '',
       mappingsText ? `## Player Identity Mappings\n${mappingsText}` : '',
@@ -368,14 +470,15 @@ export class ContextAssembler {
           parts.push(
             `P2 — Scene detected from keywords: "${event.data.scene_title}" ` +
             `(matched: ${(event.data.matched_keywords as string[])?.join(', ') ?? ''}). ` +
-            `Fetch the scene card "${event.data.scene_card}" for read-aloud text.`
+            `The scene card has been pre-fetched below — use it for read-aloud text, objectives, and setup notes.`
           );
           break;
         case 'npc_first_appearance': {
           const pron = event.data.npc_pronunciation ? ` (${event.data.npc_pronunciation})` : '';
           parts.push(
             `P2 — NPC first appearance: ${event.data.npc_name}${pron}. ` +
-            `Brief: ${event.data.npc_brief}`
+            `Brief: ${event.data.npc_brief}. ` +
+            `Full character card has been pre-fetched below.`
           );
           break;
         }
