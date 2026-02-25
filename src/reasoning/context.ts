@@ -46,7 +46,7 @@ const BUDGET_RESPONSE_RESERVE = 2000;
 // ── MCP result extraction ─────────────────────────────────────────────────
 
 /** Extract text content from an MCP callTool result. */
-function extractMcpText(result: unknown): string | null {
+export function extractMcpText(result: unknown): string | null {
   if (!result || typeof result !== 'object') return null;
   const r = result as Record<string, unknown>;
   if (Array.isArray(r.content)) {
@@ -143,7 +143,7 @@ export class ContextAssembler {
     const [gameStateRaw, episodePlanRaw, sceneCardRaw, npcCardRaw] = await Promise.allSettled([
       this.mcp.readResource('foundry', 'game://state'),
       config.campaignWikiCard && this.mcp.isConnected('wiki')
-        ? this.mcp.readResource('wiki', `card://${config.campaignWikiCard}`)
+        ? this.fetchWikiCard(config.campaignWikiCard).then(t => t ?? '')
         : Promise.resolve(''),
       sceneCardPath ? this.fetchWikiCard(sceneCardPath) : Promise.resolve(null),
       npcCardPath ? this.fetchWikiCard(npcCardPath) : Promise.resolve(null),

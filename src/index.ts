@@ -21,6 +21,7 @@ import { PacingStateManager } from './state/pacing.js';
 import { AdviceMemoryBuffer } from './state/advice-memory.js';
 import { TriggerDetector, loadFuzzyMatchTable } from './reasoning/triggers.js';
 import { ReasoningEngine } from './reasoning/engine.js';
+import { extractMcpText } from './reasoning/context.js';
 import { NpcCacheBuilder } from './reasoning/npc-cache.js';
 import { SceneIndexBuilder } from './reasoning/scene-index.js';
 import { AdviceDelivery } from './output/index.js';
@@ -687,9 +688,13 @@ async function main(): Promise<void> {
   // ── Step 3b: Validate episode plan wiki card ──────────────────────────
   if (config.campaignWikiCard) {
     try {
-      const planRaw = await mcp.readResource('wiki', `card://${config.campaignWikiCard}`, 10_000);
-      if (planRaw && planRaw.length > 0) {
-        logger.info(`  Episode plan loaded from wiki card: "${config.campaignWikiCard}" (${planRaw.length} chars)`);
+      const planResult = await mcp.callTool('wiki__get_card', {
+        name: config.campaignWikiCard,
+        max_content_length: 0,  // unlimited
+      });
+      const planText = extractMcpText(planResult);
+      if (planText && planText.length > 0) {
+        logger.info(`  Episode plan loaded from wiki card: "${config.campaignWikiCard}" (${planText.length} chars)`);
       } else {
         logger.warn(`  Episode plan wiki card "${config.campaignWikiCard}" exists but is empty — assistant will have no scene knowledge.`);
       }
