@@ -1,0 +1,37 @@
+{
+  "_comment": "STT garbling patterns: garbled form → correct term. Used by auto-ACTIVE detection and NPC cache lookup. Grow this file from post-session STT quality reviews.",
+
+  "darwin": "darjin",
+  "door gin": "darjin",
+  "dar jean": "darjin",
+
+  "yahoo": "zau'yhtaal",
+  "za tall": "zau'yhtaal",
+
+  "belton": "veltin",
+  "felton": "veltin",
+  "melton": "veltin",
+
+  "dow crush": "daokresh",
+  "doubt crash": "daokresh",
+  "dow crash": "daokresh",
+
+  "velcor": "vaelkor",
+  "belcourt": "vaelkor",
+  "veil core": "vaelkor",
+
+  "8 calves right": "8-kav-zraeth",
+  "8 cats rates": "8-kav-zraeth",
+  "8 cav's ray": "8-kav-zraeth",
+
+  "kyla torres": "kalyra taris",
+  "kyler terrace": "kalyra taris",
+
+  "honeybear": "honeybear",
+
+  "kalamine": "kalamynth",
+  "calamine": "kalamynth",
+
+  "kreshling": "kreshling",
+  "crushing": "kreshling"
+}

@@ -1,6 +1,7 @@
 /**
- * Reasoning engine — invokes Claude with MCP tool use for GM advice.
+ * v2 Reasoning engine — invokes Claude with MCP tool use for GM advice.
  * Single-threaded: queues new triggers if processing is in progress.
+ * Parses JSON advice envelopes, checks dedup, pushes to advice memory.
  */
 
 import { EventEmitter } from 'events';
@@ -8,15 +9,17 @@ import Anthropic from '@anthropic-ai/sdk';
 import { getConfig } from '../config.js';
 import { logger } from '../logger.js';
 import { ContextAssembler } from './context.js';
+import { parseAdviceEnvelope, wrapFreeTextAsEnvelope, isNoAdvice } from './envelope-parser.js';
 import type { McpAggregator } from '../mcp/client.js';
-import type { TriggerBatch, GmAdvice } from '../types/index.js';
+import type { PacingStateManager } from '../state/pacing.js';
+import type { AdviceMemoryBuffer } from '../state/advice-memory.js';
+import type { TriggerBatch, AdviceEnvelope, TriggerPriority, NpcCacheEntry, SceneIndexEntry } from '../types/index.js';
 
 const MAX_TOOL_ITERATIONS = 5;
 const MAX_TOOL_RESULT_CHARS = 5000;
-const NO_ADVICE_SENTINEL = 'NO_ADVICE';
 
 export interface ReasoningEngineEvents {
-  advice: [advice: GmAdvice];
+  advice: [envelope: AdviceEnvelope];
 }
 
 /** Returns the current transcript cache snapshot for context assembly. */
@@ -26,25 +29,44 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
   private client: Anthropic;
   private assembler: ContextAssembler;
   private mcp: McpAggregator;
+  private pacing: PacingStateManager;
+  private memory: AdviceMemoryBuffer;
   private getTranscript: TranscriptProvider;
   private processing = false;
   private queuedBatch: TriggerBatch | null = null;
 
-  constructor(mcp: McpAggregator, transcriptProvider: TranscriptProvider) {
+  constructor(
+    mcp: McpAggregator,
+    pacing: PacingStateManager,
+    memory: AdviceMemoryBuffer,
+    transcriptProvider: TranscriptProvider,
+  ) {
     super();
     const config = getConfig();
     this.client = new Anthropic({ apiKey: config.anthropicApiKey });
     this.mcp = mcp;
+    this.pacing = pacing;
+    this.memory = memory;
     this.getTranscript = transcriptProvider;
-    this.assembler = new ContextAssembler(mcp);
+    this.assembler = new ContextAssembler(mcp, pacing, memory);
     this.assembler.loadTemplate();
+  }
+
+  /** Forward NPC cache to the context assembler for injection into context. */
+  setNpcCache(cache: NpcCacheEntry[]): void {
+    this.assembler.setNpcCache(cache);
+  }
+
+  /** Forward scene index to the context assembler for injection into context. */
+  setSceneIndex(index: SceneIndexEntry[]): void {
+    this.assembler.setSceneIndex(index);
   }
 
   /**
    * Process a trigger batch. If already processing, queues the batch
    * (freshest data wins — overwrites any previously queued batch).
    */
-  async process(batch: TriggerBatch): Promise<GmAdvice | null> {
+  async process(batch: TriggerBatch): Promise<AdviceEnvelope | null> {
     if (this.processing) {
       logger.debug('ReasoningEngine: already processing — queuing batch');
       this.queuedBatch = batch;
@@ -52,15 +74,13 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
     }
 
     this.processing = true;
-    let result: GmAdvice | null = null;
+    let result: AdviceEnvelope | null = null;
     try {
       result = await this.runReasoning(batch);
     } catch (err) {
       logger.error('ReasoningEngine: error:', err);
     }
 
-    // Release lock, then drain queue.
-    // JS is single-threaded so nothing can interleave between these two lines.
     this.processing = false;
     this.drainQueue();
 
@@ -71,15 +91,19 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
     if (!this.queuedBatch) return;
     const next = this.queuedBatch;
     this.queuedBatch = null;
-    // Re-enters process() which re-acquires the lock synchronously
-    this.process(next).then((advice) => {
-      if (advice) this.emit('advice', advice);
-    }).catch((err) => {
-      logger.error('ReasoningEngine: error processing queued batch:', err);
-    });
+    // Delay before processing the next batch to avoid back-to-back API calls
+    // that could hit the org-level rate limit (30k tokens/min).
+    const INTER_CALL_DELAY_MS = 10_000;
+    setTimeout(() => {
+      this.process(next).then((envelope) => {
+        if (envelope) this.emit('advice', envelope);
+      }).catch((err) => {
+        logger.error('ReasoningEngine: error processing queued batch:', err);
+      });
+    }, INTER_CALL_DELAY_MS);
   }
 
-  private async runReasoning(batch: TriggerBatch): Promise<GmAdvice | null> {
+  private async runReasoning(batch: TriggerBatch): Promise<AdviceEnvelope | null> {
     const config = getConfig();
 
     try {
@@ -89,7 +113,7 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
       const messages: Anthropic.Messages.MessageParam[] = [
         {
           role: 'user',
-          content: `${context.gameState}\n\n## Current Situation\n${context.triggerSummary}\n\n## Recent Transcript\n${context.recentTranscript}`,
+          content: context.gameState,
         },
       ];
 
@@ -101,7 +125,7 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
         tools: context.tools as Anthropic.Messages.Tool[],
       });
 
-      // Tool use loop — track calls to detect zombie loops (same tool+args repeated)
+      // Tool use loop with zombie guard
       let iterations = 0;
       const calledTools = new Set<string>();
 
@@ -114,7 +138,6 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
 
         const toolResults: Anthropic.Messages.ToolResultBlockParam[] = [];
         for (const toolUse of toolUseBlocks) {
-          // Zombie guard: short-circuit if we've already called this exact tool+args
           const callKey = `${toolUse.name}:${JSON.stringify(toolUse.input)}`;
           if (calledTools.has(callKey)) {
             logger.warn(`ReasoningEngine: skipping duplicate tool call (${toolUse.name})`);
@@ -135,7 +158,7 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
             );
             let content = typeof result === 'string' ? result : JSON.stringify(result);
             if (content.length > MAX_TOOL_RESULT_CHARS) {
-              logger.warn(`ReasoningEngine: truncating tool result from ${toolUse.name} (${content.length} chars → ${MAX_TOOL_RESULT_CHARS})`);
+              logger.warn(`ReasoningEngine: truncating tool result from ${toolUse.name} (${content.length} → ${MAX_TOOL_RESULT_CHARS} chars)`);
               content = content.slice(0, MAX_TOOL_RESULT_CHARS) + '\n\n[Result truncated. Use more specific parameters to narrow the query.]';
             }
             toolResults.push({
@@ -172,27 +195,77 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
       const textBlocks = response.content.filter(
         (block): block is Anthropic.Messages.TextBlock => block.type === 'text'
       );
-      const adviceText = textBlocks.map((b) => b.text).join('\n').trim();
+      const adviceText = textBlocks.map(b => b.text).join('\n').trim();
 
-      // Check for NO_ADVICE sentinel
-      if (!adviceText || adviceText === NO_ADVICE_SENTINEL) {
+      if (!adviceText) {
+        logger.info('ReasoningEngine: empty response from Claude');
+        return null;
+      }
+
+      // Parse as JSON envelope
+      const highestPriority = Math.min(...batch.events.map(e => e.priority)) as TriggerPriority;
+      let envelope = parseAdviceEnvelope(adviceText);
+      if (!envelope) {
+        // Fall back to free-text wrapping
+        envelope = wrapFreeTextAsEnvelope(adviceText, highestPriority);
+      }
+
+      // Check NO_ADVICE sentinel
+      if (isNoAdvice(envelope)) {
         logger.info('ReasoningEngine: Claude returned NO_ADVICE');
         return null;
       }
 
-      logger.info(`ReasoningEngine: generated advice (${iterations} tool iterations)`);
+      // Dedup check against memory
+      if (this.memory.isDuplicate(envelope)) {
+        logger.info(`ReasoningEngine: dedup — suppressing duplicate advice [${envelope.tag}]`);
+        return null;
+      }
 
-      return {
-        trigger: batch.events[0]?.type ?? 'heartbeat',
-        context: batch.events.map((e) => `${e.type}:${e.source}`).join(', '),
-        advice: adviceText,
-        confidence: 1.0,
-        sources: [],
-        createdAt: new Date().toISOString(),
-      };
+      // Anti-echo telemetry: check if advice body substantially overlaps with transcript
+      this.checkAntiEcho(envelope, context.recentTranscript);
+
+      // Wiki-first telemetry: log if a question was answered without referencing wiki cards
+      if (batch.events.some(e => e.type === 'gm_question') && envelope.source_cards.length === 0) {
+        logger.warn(`ReasoningEngine: wiki-first gap — question answered without wiki references [${envelope.tag}]`);
+      }
+
+      // Push to memory buffer
+      this.memory.push(envelope);
+      logger.info(`ReasoningEngine: generated advice [${envelope.tag}] (${iterations} tool iterations)`);
+
+      return envelope;
     } catch (err) {
       logger.error('ReasoningEngine: error during reasoning:', err);
       return null;
+    }
+  }
+
+  /**
+   * Anti-echo telemetry: check if the advice body overlaps significantly
+   * with recent transcript content. Logs a warning but does not block delivery.
+   */
+  private checkAntiEcho(envelope: AdviceEnvelope, transcript: string): void {
+    if (!envelope.body || !transcript) return;
+
+    const adviceWords = envelope.body.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+    if (adviceWords.length < 4) return;
+
+    const transcriptLower = transcript.toLowerCase();
+    let overlapCount = 0;
+    const totalNgrams = adviceWords.length - 3;
+
+    for (let i = 0; i < totalNgrams; i++) {
+      const ngram = adviceWords.slice(i, i + 4).join(' ');
+      if (transcriptLower.includes(ngram)) overlapCount++;
+    }
+
+    const overlapRatio = overlapCount / totalNgrams;
+    if (overlapRatio > 0.3) {
+      logger.warn(
+        `ReasoningEngine: anti-echo — ${Math.round(overlapRatio * 100)}% 4-gram overlap ` +
+        `with transcript [${envelope.tag}]`
+      );
     }
   }
 }

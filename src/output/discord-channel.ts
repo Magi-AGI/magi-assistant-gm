@@ -1,21 +1,21 @@
 /**
  * Advice delivery to Discord via webhook (backup channel).
+ * v2: formats AdviceEnvelope with **[TAG]** Markdown prefix.
  */
 
 import { getConfig } from '../config.js';
 import { logger } from '../logger.js';
-import type { GmAdvice } from '../types/index.js';
+import type { AdviceEnvelope } from '../types/index.js';
 
 export class DiscordChannelOutput {
-  async deliver(advice: GmAdvice): Promise<boolean> {
+  async deliver(envelope: AdviceEnvelope): Promise<boolean> {
     const config = getConfig();
     if (!config.discordAdviceWebhookUrl) {
       return false;
     }
 
-    const triggerLabel = advice.trigger.replace('_', ' ');
     const body = {
-      content: `**[${triggerLabel}]** ${advice.advice}`,
+      content: `**[${envelope.tag}]** ${envelope.body ?? ''}`,
       username: 'Magi GM Assistant',
       // Prevent model-generated @everyone/@here/role mentions
       allowed_mentions: { parse: [] },
@@ -33,7 +33,7 @@ export class DiscordChannelOutput {
         return false;
       }
 
-      logger.debug('DiscordChannelOutput: delivered advice to Discord webhook');
+      logger.debug(`DiscordChannelOutput: delivered [${envelope.tag}] to Discord webhook`);
       return true;
     } catch (err) {
       logger.error('DiscordChannelOutput: failed to deliver:', err);
