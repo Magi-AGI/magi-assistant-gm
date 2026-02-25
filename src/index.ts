@@ -200,6 +200,7 @@ async function buildActivationCaches(episodePlanCard: string): Promise<void> {
       }));
       triggers.backfillNpcMentions(recentSegments);
     }
+    if (engine) engine.setNpcCache(npcCache);
     logger.info(`Orchestrator: NPC cache ready (${npcCache.length} entries)`);
   } else {
     pacing.setNpcCacheStatus('error');
@@ -212,6 +213,7 @@ async function buildActivationCaches(episodePlanCard: string): Promise<void> {
     pacing.setSceneIndexStatus('ready');
     pacing.markSceneIndexBuilt();
     if (triggers) triggers.setSceneIndex(sceneIndex);
+    if (engine) engine.setSceneIndex(sceneIndex);
     logger.info(`Orchestrator: scene index ready (${sceneIndex.length} entries)`);
   } else {
     pacing.setSceneIndexStatus('error');
@@ -600,8 +602,17 @@ function applyGmCommand(cmd: import('./types/index.js').GmCommand): void {
     case 'npc': {
       const subcommand = cmd.args[0]?.toLowerCase();
       if (subcommand === 'refresh' && config.campaignWikiCard) {
-        logger.info('GM command: forcing NPC cache rebuild');
-        buildActivationCaches(config.campaignWikiCard);
+        if (activationBuildInProgress) {
+          logger.warn('GM command: NPC cache rebuild already in progress, skipping');
+        } else {
+          logger.info('GM command: forcing NPC cache rebuild');
+          activationBuildInProgress = true;
+          buildActivationCaches(config.campaignWikiCard).catch(err => {
+            logger.error('GM command: NPC cache rebuild failed:', err);
+          }).finally(() => {
+            activationBuildInProgress = false;
+          });
+        }
       } else if (subcommand === 'serve') {
         const npcName = cmd.args.slice(1).join(' ').toLowerCase();
         const npc = npcCache.find(n => n.key === npcName || n.aliases.includes(npcName));

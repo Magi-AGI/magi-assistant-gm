@@ -6,7 +6,7 @@ import { logger } from '../logger.js';
 import type { AdviceEnvelope, AdviceCategory, TriggerPriority } from '../types/index.js';
 
 const VALID_CATEGORIES: ReadonlySet<string> = new Set<AdviceCategory>([
-  'script', 'pacing', 'continuity', 'spotlight',
+  'script', 'gap-fill', 'pacing', 'continuity', 'spotlight',
   'mechanics', 'technical', 'creative', 'none',
 ]);
 

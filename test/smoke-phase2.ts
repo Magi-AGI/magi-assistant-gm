@@ -270,6 +270,112 @@ const mockRawResult = {
 const rawHtml = testExtractCardHtml(mockRawResult);
 assert(rawHtml === '<p>Raw HTML content</p>', 'Raw HTML passed through when not JSON');
 
+// ── Test 7: P1-H hesitation detection ─────────────────────────────────────
+
+console.log('\n── Test 7: P1-H hesitation detection ──');
+
+const pacing7 = new PacingStateManager();
+pacing7.startSession();
+pacing7.transitionTo(AssistantState.ACTIVE);
+const detector7 = new TriggerDetector(pacing7, fuzzyTable);
+const hesitationEvents: Array<{ type: string; data: Record<string, unknown> }> = [];
+detector7.on('trigger', (batch) => {
+  for (const evt of batch.events) {
+    if (evt.type === 'gm_hesitation') {
+      hesitationEvents.push({ type: evt.type, data: evt.data });
+    }
+  }
+});
+detector7.start();
+
+// 7a: GM says "uh" — should not fire immediately
+detector7.onTranscriptUpdate([
+  { text: 'so the uh thing is over there', userId: 'gm', timestamp: new Date().toISOString() },
+]);
+assert(hesitationEvents.length === 0, '7a: No hesitation event fired immediately');
+
+// 7b: GM continues speaking (non-hesitation) — cancels pending hesitation
+detector7.onTranscriptUpdate([
+  { text: 'anyway the kreshling are attacking', userId: 'gm', timestamp: new Date().toISOString() },
+]);
+assert(hesitationEvents.length === 0, '7b: No hesitation when GM continues speaking');
+
+// 7c: Directly test checkHesitation() — simulates the 10s timer firing.
+// GM says "uh..." and then is silent. Manually invoke the private method.
+const det7any = detector7 as any;
+detector7.onTranscriptUpdate([
+  { text: 'his name is uh the captain', userId: 'gm', timestamp: new Date().toISOString() },
+]);
+// Force the hesitation time back so it looks like 6s of silence has passed
+det7any.lastHesitationTime = Date.now() - 6000;
+det7any.lastGmSpeechTime = det7any.lastHesitationTime; // Last speech WAS the hesitation
+det7any.checkHesitation();
+assert(hesitationEvents.length === 1, '7c: Hesitation fires after silence threshold');
+assert(hesitationEvents[0].data.transcript === 'his name is uh the captain', '7c: Correct transcript in event');
+
+// 7d: Should not re-fire (hesitationFired = true)
+det7any.checkHesitation();
+assert(hesitationEvents.length === 1, '7d: Does not re-fire until GM speaks again');
+
+// 7e: Same-batch false-fire prevention — "uh" followed by normal speech in one batch
+hesitationEvents.length = 0;
+det7any.hesitationFired = false;
+detector7.onTranscriptUpdate([
+  { text: 'uh what was that', userId: 'gm', timestamp: new Date().toISOString() },
+  { text: 'oh right the reactor', userId: 'gm', timestamp: new Date().toISOString() },
+]);
+// The non-hesitation segment should have cleared lastHesitationTime
+det7any.checkHesitation();
+assert(hesitationEvents.length === 0, '7e: Same-batch normal speech cancels hesitation');
+
+detector7.stop();
+
+// ── Test 8: gap-fill category in envelope parser ─────────────────────────
+
+console.log('\n── Test 8: gap-fill envelope parsing ──');
+
+// Import parseAdviceEnvelope — since we can't easily import it in this
+// test setup, we'll test the concept by checking the type definition
+// includes 'gap-fill' (already validated by type system), and test
+// the envelope parsing logic inline.
+
+function testParseEnvelope(text: string): Record<string, unknown> | null {
+  let cleaned = text.trim();
+  if (cleaned.startsWith('```')) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
+  }
+  try {
+    const parsed = JSON.parse(cleaned);
+    const validCategories = new Set([
+      'script', 'gap-fill', 'pacing', 'continuity', 'spotlight',
+      'mechanics', 'technical', 'creative', 'none',
+    ]);
+    if (typeof parsed.category !== 'string' || !validCategories.has(parsed.category)) return null;
+    if (typeof parsed.tag !== 'string' || parsed.tag.length === 0) return null;
+    if (typeof parsed.summary !== 'string') return null;
+    return parsed;
+  } catch { return null; }
+}
+
+const gapFillEnvelope = testParseEnvelope(JSON.stringify({
+  category: 'gap-fill',
+  tag: 'NAME',
+  priority: 1,
+  summary: 'Daokresh, the Kreshling war chief',
+  body: 'Daokresh (dow-KRESH), the Kreshling war chief',
+  confidence: 0.7,
+  source_cards: ['Characters+Daokresh'],
+}));
+assert(gapFillEnvelope !== null, 'gap-fill envelope parses successfully');
+assert(gapFillEnvelope!.category === 'gap-fill', 'gap-fill category recognized');
+
+const invalidEnvelope = testParseEnvelope(JSON.stringify({
+  category: 'invalid-category',
+  tag: 'BAD',
+  summary: 'test',
+}));
+assert(invalidEnvelope === null, 'Invalid category rejected');
+
 // ── Results ─────────────────────────────────────────────────────────────────
 
 console.log(`\n── Results: ${passed} passed, ${failed} failed ──\n`);

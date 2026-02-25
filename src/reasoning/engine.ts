@@ -13,7 +13,7 @@ import { parseAdviceEnvelope, wrapFreeTextAsEnvelope, isNoAdvice } from './envel
 import type { McpAggregator } from '../mcp/client.js';
 import type { PacingStateManager } from '../state/pacing.js';
 import type { AdviceMemoryBuffer } from '../state/advice-memory.js';
-import type { TriggerBatch, AdviceEnvelope, TriggerPriority } from '../types/index.js';
+import type { TriggerBatch, AdviceEnvelope, TriggerPriority, NpcCacheEntry, SceneIndexEntry } from '../types/index.js';
 
 const MAX_TOOL_ITERATIONS = 5;
 const MAX_TOOL_RESULT_CHARS = 5000;
@@ -50,6 +50,16 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
     this.getTranscript = transcriptProvider;
     this.assembler = new ContextAssembler(mcp, pacing, memory);
     this.assembler.loadTemplate();
+  }
+
+  /** Forward NPC cache to the context assembler for injection into context. */
+  setNpcCache(cache: NpcCacheEntry[]): void {
+    this.assembler.setNpcCache(cache);
+  }
+
+  /** Forward scene index to the context assembler for injection into context. */
+  setSceneIndex(index: SceneIndexEntry[]): void {
+    this.assembler.setSceneIndex(index);
   }
 
   /**
@@ -212,6 +222,14 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
         return null;
       }
 
+      // Anti-echo telemetry: check if advice body substantially overlaps with transcript
+      this.checkAntiEcho(envelope, context.recentTranscript);
+
+      // Wiki-first telemetry: log if a question was answered without referencing wiki cards
+      if (batch.events.some(e => e.type === 'gm_question') && envelope.source_cards.length === 0) {
+        logger.warn(`ReasoningEngine: wiki-first gap — question answered without wiki references [${envelope.tag}]`);
+      }
+
       // Push to memory buffer
       this.memory.push(envelope);
       logger.info(`ReasoningEngine: generated advice [${envelope.tag}] (${iterations} tool iterations)`);
@@ -220,6 +238,34 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
     } catch (err) {
       logger.error('ReasoningEngine: error during reasoning:', err);
       return null;
+    }
+  }
+
+  /**
+   * Anti-echo telemetry: check if the advice body overlaps significantly
+   * with recent transcript content. Logs a warning but does not block delivery.
+   */
+  private checkAntiEcho(envelope: AdviceEnvelope, transcript: string): void {
+    if (!envelope.body || !transcript) return;
+
+    const adviceWords = envelope.body.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+    if (adviceWords.length < 4) return;
+
+    const transcriptLower = transcript.toLowerCase();
+    let overlapCount = 0;
+    const totalNgrams = adviceWords.length - 3;
+
+    for (let i = 0; i < totalNgrams; i++) {
+      const ngram = adviceWords.slice(i, i + 4).join(' ');
+      if (transcriptLower.includes(ngram)) overlapCount++;
+    }
+
+    const overlapRatio = overlapCount / totalNgrams;
+    if (overlapRatio > 0.3) {
+      logger.warn(
+        `ReasoningEngine: anti-echo — ${Math.round(overlapRatio * 100)}% 4-gram overlap ` +
+        `with transcript [${envelope.tag}]`
+      );
     }
   }
 }

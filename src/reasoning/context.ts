@@ -9,7 +9,7 @@ import { logger } from '../logger.js';
 import type { McpAggregator } from '../mcp/client.js';
 import type { PacingStateManager } from '../state/pacing.js';
 import type { AdviceMemoryBuffer } from '../state/advice-memory.js';
-import type { TriggerBatch, AssembledContext } from '../types/index.js';
+import type { TriggerBatch, AssembledContext, NpcCacheEntry, SceneIndexEntry } from '../types/index.js';
 
 // ── Tools that Claude must NOT call directly ────────────────────────────────
 // Image posting requires GM confirmation via /yes — Claude suggests, orchestrator posts.
@@ -37,16 +37,27 @@ function estimateTokens(text: string): number {
 const BUDGET_EPISODE_PLAN = 1500;
 const BUDGET_ROSTER = 1500;
 const BUDGET_ALREADY_ADVISED = 1500;
+const BUDGET_NPC_CACHE = 500;
 const BUDGET_RESPONSE_RESERVE = 2000;
 
 export class ContextAssembler {
   private systemPromptTemplate: string = '';
+  private npcCache: NpcCacheEntry[] = [];
+  private sceneIndex: SceneIndexEntry[] = [];
 
   constructor(
     private mcp: McpAggregator,
     private pacing: PacingStateManager,
     private memory: AdviceMemoryBuffer,
   ) {}
+
+  setNpcCache(cache: NpcCacheEntry[]): void {
+    this.npcCache = cache;
+  }
+
+  setSceneIndex(index: SceneIndexEntry[]): void {
+    this.sceneIndex = index;
+  }
 
   /** Load the system prompt template from disk. */
   loadTemplate(): void {
@@ -106,6 +117,7 @@ export class ContextAssembler {
     const pacingBlock = this.buildPacingBlock();
     const rosterBlock = this.buildCompressedRoster(gameState);
     const episodeBlock = this.truncateToTokens(this.stripHtml(episodePlan || 'No episode plan loaded.'), BUDGET_EPISODE_PLAN);
+    const npcBlock = this.buildNpcBlock();
     const advisedBlock = this.buildAlreadyAdvisedBlock();
     const freshnessBlock = this.buildFreshnessWarnings();
     const mappingsText = this.buildMappingsText();
@@ -127,6 +139,7 @@ export class ContextAssembler {
       estimateTokens(pacingBlock) +
       estimateTokens(rosterBlock) +
       estimateTokens(episodeBlock) +
+      estimateTokens(npcBlock) +
       estimateTokens(advisedBlock) +
       estimateTokens(freshnessBlock) +
       estimateTokens(mappingsText) +
@@ -158,6 +171,7 @@ export class ContextAssembler {
       `## Pacing State\n${pacingBlock}`,
       `## Episode Plan (Current Act)\n${episodeBlock}`,
       `## Character Roster\n${rosterBlock}`,
+      npcBlock ? `## NPC Reference (Pre-Cached)\n${npcBlock}` : '',
       mappingsText ? `## Player Identity Mappings\n${mappingsText}` : '',
       advisedBlock ? `## ${advisedBlock}` : '',
       `## Recent Transcript\n${recentTranscript}`,
@@ -180,6 +194,8 @@ export class ContextAssembler {
       pacingState: this.pacing.state,
       freshness: this.pacing.freshness,
       alreadyAdvised: [...this.memory.entries],
+      npcCache: this.npcCache.length > 0 ? this.npcCache : undefined,
+      sceneIndex: this.sceneIndex.length > 0 ? this.sceneIndex : undefined,
       tools,
       estimatedTokens: totalTokens,
     };
@@ -250,6 +266,21 @@ export class ContextAssembler {
     } catch {
       return 'Failed to parse character roster.';
     }
+  }
+
+  /** Build compact NPC reference from pre-cache. Full briefs for unserved, names-only for served. */
+  private buildNpcBlock(): string {
+    if (this.npcCache.length === 0) return '';
+    const unserved = this.npcCache.filter(n => !n.served);
+    const served = this.npcCache.filter(n => n.served);
+    const lines: string[] = [];
+    for (const npc of unserved) {
+      lines.push(`- ${npc.brief} [not yet appeared]`);
+    }
+    if (served.length > 0) {
+      lines.push(`- Already appeared: ${served.map(n => n.display_name).join(', ')}`);
+    }
+    return this.truncateToTokens(lines.join('\n'), BUDGET_NPC_CACHE);
   }
 
   private buildAlreadyAdvisedBlock(): string {
@@ -324,11 +355,43 @@ export class ContextAssembler {
         case 'gm_question':
           parts.push(`P1 — GM question: "${(event.data.transcript as string)?.slice(0, 200) ?? ''}"`);
           break;
+        case 'gm_hesitation':
+          parts.push(
+            `P1-H — GM hesitation gap-fill: "${(event.data.transcript as string)?.slice(0, 200) ?? ''}" ` +
+            `(${event.data.silenceSeconds}s silence). Respond with category "gap-fill": a single short line with the most likely missing piece.`
+          );
+          break;
         case 'scene_transition':
           parts.push(`P2 — Scene transition (source: ${event.source})`);
           break;
+        case 'scene_transition_detected':
+          parts.push(
+            `P2 — Scene detected from keywords: "${event.data.scene_title}" ` +
+            `(matched: ${(event.data.matched_keywords as string[])?.join(', ') ?? ''}). ` +
+            `Fetch the scene card "${event.data.scene_card}" for read-aloud text.`
+          );
+          break;
+        case 'npc_first_appearance': {
+          const pron = event.data.npc_pronunciation ? ` (${event.data.npc_pronunciation})` : '';
+          parts.push(
+            `P2 — NPC first appearance: ${event.data.npc_name}${pron}. ` +
+            `Brief: ${event.data.npc_brief}`
+          );
+          break;
+        }
         case 'act_transition':
           parts.push(`P2 — Act transition (source: ${event.source})`);
+          break;
+        case 'pacing_gate_convergence':
+          parts.push(
+            `P2 — Convergence gate: ${event.data.remaining_minutes}min remaining. ` +
+            (event.data.escalation
+              ? `ESCALATION: Still in Act ${event.data.current_act}, need to accelerate toward climax.`
+              : `Open threads: ${(event.data.open_threads as string[])?.join(', ') || 'none tracked'}.`)
+          );
+          break;
+        case 'pacing_gate_denouement':
+          parts.push(`P2 — Denouement gate: ${event.data.remaining_minutes}min remaining. Time to wrap up and land the ending.`);
           break;
         case 'pacing_alert':
           parts.push(`P3 — Scene overrun: ${event.data.elapsed}min / ${event.data.planned}min planned`);

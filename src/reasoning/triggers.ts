@@ -155,6 +155,17 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
   /** P4 fires once per silence period. */
   private silenceAlertFired = false;
 
+  // ── v3: P1-H hesitation state ───────────────────────────────────────────
+
+  /** Timestamp when GM last spoke a hesitation keyword. */
+  private lastHesitationTime = 0;
+  /** Text of the last GM segment containing a hesitation keyword. */
+  private lastHesitationText = '';
+  /** Prevents re-firing until GM speaks again. */
+  private hesitationFired = false;
+  private readonly hesitationSilenceMs: number;
+  private readonly hesitationPatterns: RegExp[];
+
   /** Recent transcript segments for flowing-RP detection. */
   private recentSegments: Array<{ userId: string; timestamp: number }> = [];
 
@@ -200,6 +211,13 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
     this.autoActiveWindowMs = config.autoActiveWindowMinutes * 60_000;
     this.autoActiveThreshold = config.autoActiveThreshold;
 
+    // v3: P1-H hesitation config (pre-compile patterns)
+    this.hesitationSilenceMs = config.hesitationSilenceSeconds * 1000;
+    this.hesitationPatterns = config.hesitationKeywords.map(kw => {
+      const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return new RegExp(`\\b${escaped}\\b`, 'i');
+    });
+
     // v3: load fuzzy match table
     if (fuzzyTable) {
       this.fuzzyTable = fuzzyTable;
@@ -216,8 +234,9 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
   start(): void {
     const config = getConfig();
 
-    // Silence detection: check every 10s
+    // Silence + hesitation detection: check every 10s
     this.silenceTimer = setInterval(() => {
+      this.checkHesitation();
       this.checkSilence();
       this.checkPacingGates();
     }, 10_000);
@@ -304,6 +323,20 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
       if (isGmSpeech) {
         this.lastGmSpeechTime = now;
         this.silenceAlertFired = false;
+        this.hesitationFired = false; // Reset on new GM speech
+
+        // v3: P1-H — track hesitation keywords.
+        // If the segment contains a hesitation keyword, start tracking.
+        // If it does NOT, clear the pending hesitation — the GM continued
+        // speaking, so there's no gap to fill. This also prevents false-fires
+        // when a hesitation segment and a normal segment arrive in the same
+        // poll batch (same `now` value).
+        if (this.isHesitationKeyword(seg.text)) {
+          this.lastHesitationTime = now;
+          this.lastHesitationText = seg.text;
+        } else if (seg.text.trim().length > 0) {
+          this.lastHesitationTime = 0;
+        }
       }
 
       // Track for flowing-RP detection
@@ -603,6 +636,43 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
         data: {
           remaining_minutes: remainingMin,
           session_end_time: sessionEndTime,
+        },
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  // ── v3: Hesitation Detection (P1-H) ─────────────────────────────────────
+
+  /** Check if text contains a hesitation keyword (pre-compiled patterns). */
+  private isHesitationKeyword(text: string): boolean {
+    return this.hesitationPatterns.some(p => p.test(text));
+  }
+
+  /**
+   * P1-H: If GM's last speech contained a hesitation keyword and they've been
+   * silent for ≥hesitationSilenceMs, fire a gap-fill trigger.
+   */
+  private checkHesitation(): void {
+    if (this.pacing.assistantState !== AssistantState.ACTIVE) return;
+    if (this.hesitationFired) return;
+    if (this.lastHesitationTime === 0) return;
+
+    // Only fire if the last GM speech was the hesitation (GM hasn't spoken since)
+    if (this.lastHesitationTime !== this.lastGmSpeechTime) return;
+
+    const now = Date.now();
+    const silenceMs = now - this.lastHesitationTime;
+    if (silenceMs >= this.hesitationSilenceMs) {
+      this.hesitationFired = true;
+      logger.info(`TriggerDetector: P1-H hesitation (${Math.round(silenceMs / 1000)}s silence after "${this.lastHesitationText.slice(0, 80)}")`);
+      this.addEvent({
+        type: 'gm_hesitation',
+        priority: TriggerPriority.P1,
+        source: 'hesitation',
+        data: {
+          transcript: this.lastHesitationText,
+          silenceSeconds: Math.round(silenceMs / 1000),
         },
         timestamp: new Date().toISOString(),
       });
