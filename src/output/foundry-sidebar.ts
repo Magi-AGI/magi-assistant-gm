@@ -49,4 +49,27 @@ export class FoundryAdviceOutput {
       return false;
     }
   }
+
+  /**
+   * Deliver a system message (readiness report, status alert) as a Foundry whisper.
+   */
+  async deliverSystemMessage(message: string): Promise<boolean> {
+    if (!this.mcp.isConnected('foundry')) {
+      return false;
+    }
+
+    // Convert plain text to HTML (preserve line breaks)
+    const html = `<p style="font-size:0.9em">${message.replace(/\n/g, '<br>')}</p>`;
+
+    try {
+      await this.mcp.callTool('foundry__send_whisper', {
+        content: html,
+        title: 'Magi GM Assistant',
+      });
+      return true;
+    } catch (err) {
+      logger.debug('FoundryAdviceOutput: failed to deliver system message:', err);
+      return false;
+    }
+  }
 }

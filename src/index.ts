@@ -820,6 +820,7 @@ async function main(): Promise<void> {
 
   // ── Step 3b: v4 — Wiki discovery (session plan, fuzzy table, NPC links) ──
   let fuzzyTable: import('./reasoning/triggers.js').FuzzyMatchTable = {};
+  let readinessReport: string | null = null;
 
   if (config.campaignName) {
     const discovery = await runWikiDiscovery(mcp, config);
@@ -834,9 +835,9 @@ async function main(): Promise<void> {
       }
     }
 
-    // Log readiness report
-    const report = formatReadinessReport(discovery, config);
-    for (const line of report.split('\n')) {
+    // Log readiness report (also posted to Discord after delivery is initialized)
+    readinessReport = formatReadinessReport(discovery, config);
+    for (const line of readinessReport.split('\n')) {
       logger.info(`  ${line}`);
     }
   } else {
@@ -889,6 +890,15 @@ async function main(): Promise<void> {
   delivery = new AdviceDelivery(mcp);
 
   triggers = new TriggerDetector(pacing, fuzzyTable);
+
+  // v4: Post readiness report to Discord + Foundry (Phase 3 of startup)
+  if (readinessReport) {
+    delivery.postSystemMessage(readinessReport).then(ok => {
+      if (!ok) logger.warn('Readiness report could not be posted to any channel (webhook may not be configured).');
+    }).catch(err => {
+      logger.warn('Failed to post readiness report:', err);
+    });
+  }
 
   // v3: Listen for activation events from trigger detector
   triggers.on('activated', (source: ActivationSource) => {
