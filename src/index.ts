@@ -1,5 +1,5 @@
 /**
- * Magi GM Assistant v3 — Event-driven orchestrator.
+ * Magi GM Assistant v4 — Event-driven orchestrator.
  *
  * v2 base: P1-P4 priority triggers, PREGAME/ACTIVE/SLEEP state machine,
  * wiki hard gate, image queue, GM command parsing.
@@ -9,6 +9,11 @@
  * - ACTIVE initialization: NPC pre-cache + scene index build (async, non-blocking)
  * - Pacing gates: convergence/denouement triggers on wall-clock time
  * - GM commands: /endtime, /npc refresh, /npc serve
+ *
+ * v4 additions:
+ * - Wiki discovery: auto-discover session plan, fuzzy table, NPC links from wiki tags
+ * - Readiness report: structured startup status log
+ * - CAMPAIGN_NAME + CAMPAIGN_GROUP replace manual CAMPAIGN_WIKI_CARD for discovery
  */
 
 import { config as dotenvConfig } from 'dotenv';
@@ -22,6 +27,7 @@ import { AdviceMemoryBuffer } from './state/advice-memory.js';
 import { TriggerDetector, loadFuzzyMatchTable } from './reasoning/triggers.js';
 import { ReasoningEngine } from './reasoning/engine.js';
 import { extractMcpText } from './reasoning/context.js';
+import { runWikiDiscovery, formatReadinessReport } from './discovery/wiki-bootstrap.js';
 import { NpcCacheBuilder } from './reasoning/npc-cache.js';
 import { SceneIndexBuilder } from './reasoning/scene-index.js';
 import { AdviceDelivery } from './output/index.js';
@@ -48,11 +54,16 @@ let npcCache: NpcCacheEntry[] = [];
 let sceneIndex: SceneIndexEntry[] = [];
 let activationBuildInProgress = false;
 
+// v4: Wiki discovery state
+let discoveredPlanCard: string | null = null;
+
 // ── Polling state ──────────────────────────────────────────────────────────
 
+let sessionWatchTimer: ReturnType<typeof setInterval> | null = null;
 let transcriptPollTimer: ReturnType<typeof setInterval> | null = null;
 let gameStatePollTimer: ReturnType<typeof setInterval> | null = null;
 let pacingUpdateTimer: ReturnType<typeof setInterval> | null = null;
+let sessionActive = false;
 let lastTranscriptRowId = 0;
 let lastSessionId: string | null = null;
 let lastSceneId: string | null = null;
@@ -85,9 +96,11 @@ async function gracefulShutdown(signal: string): Promise<void> {
   logger.info(`Received ${signal} — starting graceful shutdown...`);
 
   try {
+    if (sessionWatchTimer) clearInterval(sessionWatchTimer);
     if (transcriptPollTimer) clearInterval(transcriptPollTimer);
     if (gameStatePollTimer) clearInterval(gameStatePollTimer);
     if (pacingUpdateTimer) clearInterval(pacingUpdateTimer);
+    sessionWatchTimer = null;
     transcriptPollTimer = null;
     gameStatePollTimer = null;
     pacingUpdateTimer = null;
@@ -114,6 +127,120 @@ process.on('uncaughtException', (err) => {
   gracefulShutdown('uncaughtException');
 });
 
+// ── Session lifecycle ─────────────────────────────────────────────────────
+
+/**
+ * Start all work loops when a Discord session is detected.
+ * Called from pollForSession() when session://active returns an active session.
+ */
+function startSessionLoops(): void {
+  if (sessionActive) return;
+  sessionActive = true;
+
+  // Stop the session-watch poll
+  if (sessionWatchTimer) {
+    clearInterval(sessionWatchTimer);
+    sessionWatchTimer = null;
+  }
+
+  // Reset state for the new session
+  pacing.startSession();
+  memory.clear();
+  transcriptCache.length = 0;
+  lastTranscriptRowId = 0;
+  lastSessionId = null;
+  lastSceneId = null;
+  lastSeenChatMsgId = null;
+  lastTextEventId = 0;
+  sessionJustChanged = false;
+  npcCache = [];
+  sceneIndex = [];
+
+  if (triggers) triggers.start();
+
+  // Start work timers
+  transcriptPollTimer = setInterval(() => {
+    pollTranscript().catch(err => logger.debug('Transcript poll error:', err));
+  }, 10_000);
+
+  gameStatePollTimer = setInterval(() => {
+    pollGameState().catch(err => logger.debug('Game state poll error:', err));
+  }, 10_000);
+
+  pacingUpdateTimer = setInterval(() => {
+    pacing.updateElapsed();
+    if (triggers) {
+      triggers.checkPacingOverrun(config.sceneOverrunThresholdMinutes);
+    }
+  }, 30_000);
+
+  // Immediate first poll — don't wait 10s
+  pollTranscript().catch(err => logger.debug('Transcript poll error:', err));
+  pollGameState().catch(err => logger.debug('Game state poll error:', err));
+
+  logger.info(`Session detected — monitoring for triggers (${pacing.assistantState})`);
+}
+
+/**
+ * Stop all work loops when the Discord session ends.
+ * Called from pollTranscript() when no active session is found.
+ */
+function stopSessionLoops(): void {
+  if (!sessionActive) return;
+  sessionActive = false;
+
+  // Stop work timers
+  if (transcriptPollTimer) { clearInterval(transcriptPollTimer); transcriptPollTimer = null; }
+  if (gameStatePollTimer) { clearInterval(gameStatePollTimer); gameStatePollTimer = null; }
+  if (pacingUpdateTimer) { clearInterval(pacingUpdateTimer); pacingUpdateTimer = null; }
+
+  if (triggers) triggers.stop();
+
+  // Reset state
+  transcriptCache.length = 0;
+  lastTranscriptRowId = 0;
+  lastSessionId = null;
+  lastSceneId = null;
+  lastSeenChatMsgId = null;
+  lastTextEventId = 0;
+  npcCache = [];
+  sceneIndex = [];
+  pacing.startSession(); // resets to PREGAME
+
+  // Resume session-watch
+  sessionWatchTimer = setInterval(() => {
+    pollForSession().catch(err => logger.debug('Session watch error:', err));
+  }, 30_000);
+
+  logger.info('Session ended — returning to standby');
+}
+
+/**
+ * Lightweight poll: check Discord for an active session.
+ * Runs every 30s during standby. Triggers startSessionLoops() on detection.
+ */
+async function pollForSession(): Promise<void> {
+  if (!mcp.isConnected('discord')) return;
+  try {
+    const sessionRaw = await mcp.readResource('discord', 'session://active');
+    if (!sessionRaw) return;
+    const session = JSON.parse(sessionRaw);
+    if (!session.active || !session.sessions?.length) return;
+
+    // Session found — check guild match if configured
+    const sessions = session.sessions as Array<{ id: string; guildId?: string }>;
+    const targetGuild = config.targetGuildId;
+    if (targetGuild) {
+      const match = sessions.find((s: { id: string; guildId?: string }) => s.guildId === targetGuild);
+      if (!match) return;
+    }
+
+    startSessionLoops();
+  } catch {
+    // Discord may be temporarily unavailable — silently retry next cycle
+  }
+}
+
 // ── v3: ACTIVE Initialization ─────────────────────────────────────────────
 
 /**
@@ -133,10 +260,11 @@ async function handleActivation(source: ActivationSource): Promise<void> {
     // If caches failed or were never built, rebuild them
     const cacheMissing = npcCache.length === 0 && sceneIndex.length === 0;
     const cacheError = pacing.state.npc_cache_status === 'error' || pacing.state.scene_index_status === 'error';
-    if ((cacheMissing || cacheError) && config.campaignWikiCard && !activationBuildInProgress) {
+    const planCard = discoveredPlanCard ?? config.campaignWikiCard;
+    if ((cacheMissing || cacheError) && planCard && !activationBuildInProgress) {
       logger.info('Orchestrator: rebuilding caches (missing or errored)');
       activationBuildInProgress = true;
-      buildActivationCaches(config.campaignWikiCard).catch(err => {
+      buildActivationCaches(planCard).catch(err => {
         logger.error('Orchestrator: activation cache rebuild failed:', err);
       }).finally(() => {
         activationBuildInProgress = false;
@@ -160,9 +288,10 @@ async function handleActivation(source: ActivationSource): Promise<void> {
   }
 
   // Kick off async cache build (non-blocking — P1 triggers still work during build)
-  if (config.campaignWikiCard && !activationBuildInProgress) {
+  const episodePlan = discoveredPlanCard ?? config.campaignWikiCard;
+  if (episodePlan && !activationBuildInProgress) {
     activationBuildInProgress = true;
-    buildActivationCaches(config.campaignWikiCard).catch(err => {
+    buildActivationCaches(episodePlan).catch(err => {
       logger.error('Orchestrator: activation cache build failed:', err);
     }).finally(() => {
       activationBuildInProgress = false;
@@ -267,11 +396,8 @@ async function pollTranscript(): Promise<void> {
       if (sessionRaw) {
         const session = JSON.parse(sessionRaw);
         if (!session.active || !session.sessions?.length) {
-          if (transcriptCache.length > 0) {
-            logger.info('Transcript poll: no active session — clearing cache');
-            transcriptCache.length = 0;
-            lastTranscriptRowId = 0;
-            lastSessionId = null;
+          if (sessionActive) {
+            stopSessionLoops();
           }
           return;
         }
@@ -293,11 +419,8 @@ async function pollTranscript(): Promise<void> {
     }
 
     if (!sessionId) {
-      if (lastSessionId !== null && transcriptCache.length > 0) {
-        logger.info('Transcript poll: no matching session — clearing cache');
-        transcriptCache.length = 0;
-        lastTranscriptRowId = 0;
-        lastSessionId = null;
+      if (sessionActive) {
+        stopSessionLoops();
       }
       return;
     }
@@ -602,13 +725,14 @@ function applyGmCommand(cmd: import('./types/index.js').GmCommand): void {
     }
     case 'npc': {
       const subcommand = cmd.args[0]?.toLowerCase();
-      if (subcommand === 'refresh' && config.campaignWikiCard) {
+      const npcPlanCard = discoveredPlanCard ?? config.campaignWikiCard;
+      if (subcommand === 'refresh' && npcPlanCard) {
         if (activationBuildInProgress) {
           logger.warn('GM command: NPC cache rebuild already in progress, skipping');
         } else {
           logger.info('GM command: forcing NPC cache rebuild');
           activationBuildInProgress = true;
-          buildActivationCaches(config.campaignWikiCard).catch(err => {
+          buildActivationCaches(npcPlanCard).catch(err => {
             logger.error('GM command: NPC cache rebuild failed:', err);
           }).finally(() => {
             activationBuildInProgress = false;
@@ -632,7 +756,7 @@ function applyGmCommand(cmd: import('./types/index.js').GmCommand): void {
 // ── Startup ────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  logger.info('Magi GM Assistant v3 starting...');
+  logger.info('Magi GM Assistant v4 starting...');
   logger.info(`  Model: ${config.anthropicModel}`);
   logger.info(`  Discord MCP: ${config.discordMcpUrl}`);
   logger.info(`  Foundry MCP: ${config.foundryMcpUrl}`);
@@ -666,9 +790,18 @@ async function main(): Promise<void> {
         logger.info(`  ${serverNames[i]} health: ${healthResults[i] ? 'OK' : 'FAIL'}`);
       }
 
-      if (healthResults[2]) {
+      // v4: Wiki + Discord are hard gates; Foundry is soft (delivery degrades)
+      const discordOk = healthResults[0];
+      const wikiOk = healthResults[2];
+      if (!discordOk) {
+        logger.warn('Discord MCP health check failed — retrying...');
+      }
+      if (wikiOk && discordOk) {
         wikiHealthy = true;
         break;
+      }
+      if (wikiOk && !discordOk) {
+        // Wiki is up but Discord isn't — keep retrying for Discord
       }
     } catch (err) {
       logger.warn(`MCP startup failed (attempt ${attempt}/${STARTUP_RETRIES}):`, err);
@@ -682,41 +815,68 @@ async function main(): Promise<void> {
   }
 
   if (!wikiHealthy) {
-    throw new Error(`Wiki MCP startup failed after ${STARTUP_RETRIES} attempts — cannot start without wiki access.`);
+    throw new Error(`Wiki + Discord MCP startup failed after ${STARTUP_RETRIES} attempts — cannot start without wiki and Discord access.`);
   }
 
-  // ── Step 3b: Validate episode plan wiki card ──────────────────────────
-  if (config.campaignWikiCard) {
-    try {
-      const planResult = await mcp.callTool('wiki__get_card', {
-        name: config.campaignWikiCard,
-        max_content_length: 0,  // unlimited
-      });
-      const planText = extractMcpText(planResult);
-      if (planText && planText.length > 0) {
-        logger.info(`  Episode plan loaded from wiki card: "${config.campaignWikiCard}" (${planText.length} chars)`);
-      } else {
-        logger.warn(`  Episode plan wiki card "${config.campaignWikiCard}" exists but is empty — assistant will have no scene knowledge.`);
+  // ── Step 3b: v4 — Wiki discovery (session plan, fuzzy table, NPC links) ──
+  let fuzzyTable: import('./reasoning/triggers.js').FuzzyMatchTable = {};
+
+  if (config.campaignName) {
+    const discovery = await runWikiDiscovery(mcp, config);
+    discoveredPlanCard = discovery.planCardName;
+    fuzzyTable = discovery.fuzzyTable;
+
+    // Apply session end time from plan card (config override takes precedence)
+    if (!config.sessionEndTime && discovery.sessionEndTime) {
+      const endTime = parseSessionEndTime(discovery.sessionEndTime);
+      if (endTime) {
+        pacing.setSessionEndTime(endTime);
       }
-    } catch {
-      logger.error(`  Failed to load episode plan from wiki card "${config.campaignWikiCard}" — check card name spelling. Assistant will run without scene knowledge.`);
+    }
+
+    // Log readiness report
+    const report = formatReadinessReport(discovery, config);
+    for (const line of report.split('\n')) {
+      logger.info(`  ${line}`);
     }
   } else {
-    logger.warn('  CAMPAIGN_WIKI_CARD not set — assistant will run without episode plan knowledge.');
+    logger.warn('  CAMPAIGN_NAME not set — wiki discovery skipped. Set CAMPAIGN_NAME and tag your session plan cards.');
+
+    // Fallback: validate legacy CAMPAIGN_WIKI_CARD if set
+    if (config.campaignWikiCard) {
+      try {
+        const planResult = await mcp.callTool('wiki__get_card', {
+          name: config.campaignWikiCard,
+          max_content_length: 100,
+        });
+        const planText = extractMcpText(planResult);
+        if (planText && planText.length > 0) {
+          discoveredPlanCard = config.campaignWikiCard;
+          logger.info(`  Using legacy CAMPAIGN_WIKI_CARD: "${config.campaignWikiCard}"`);
+        } else {
+          logger.warn(`  Legacy CAMPAIGN_WIKI_CARD "${config.campaignWikiCard}" exists but is empty.`);
+        }
+      } catch {
+        logger.error(`  Legacy CAMPAIGN_WIKI_CARD "${config.campaignWikiCard}" not found — check card name spelling.`);
+      }
+    }
+
+    // Load static fuzzy table (legacy behavior when wiki discovery is skipped)
+    fuzzyTable = loadFuzzyMatchTable(config.sttFuzzyMatchPath);
+    if (Object.keys(fuzzyTable).length > 0) {
+      logger.info(`  Static fuzzy table loaded: ${Object.keys(fuzzyTable).length} terms from ${config.sttFuzzyMatchPath}`);
+    }
   }
 
-  // ── Step 3c: v3 — Load fuzzy match table ─────────────────────────────
-  const fuzzyTable = loadFuzzyMatchTable(config.sttFuzzyMatchPath);
-
-  // ── Step 3d: v3 — Log configuration warnings ────────────────────────
+  // ── Step 3c: Configuration warnings ──────────────────────────────────
   if (!config.gmIdentifier) {
     logger.warn('  GM_IDENTIFIER not set — silence detection and hesitation detection will track all speakers.');
   }
-  if (!config.sessionEndTime) {
+  if (!config.sessionEndTime && !pacing.state.session_end_time) {
     logger.warn('  SESSION_END_TIME not set — pacing gates (convergence/denouement) are disabled. Set via /endtime HH:MM during session.');
   }
   if (config.autoActiveEnabled && Object.keys(fuzzyTable).length === 0) {
-    logger.warn('  Auto-ACTIVE enabled but fuzzy match table is empty — transcript-based activation may not work. Check STT_FUZZY_MATCH_PATH.');
+    logger.warn('  Auto-ACTIVE enabled but fuzzy match table is empty — transcript-based activation may not work.');
   }
 
   // ── Step 4: Initialize state ──────────────────────────────────────────
@@ -757,29 +917,18 @@ async function main(): Promise<void> {
     }
   });
 
-  triggers.start();
+  // ── Step 6: Wait for session ───────────────────────────────────────────
+  // Don't start triggers or polling loops yet — wait for an active Discord session.
+  // This avoids wasting resources between sessions.
 
-  // ── Step 6: Start polling loops ───────────────────────────────────────
-
-  // Transcript: 10s
-  transcriptPollTimer = setInterval(() => {
-    pollTranscript().catch(err => logger.debug('Transcript poll error:', err));
-  }, 10_000);
-
-  // Game state: 10s
-  gameStatePollTimer = setInterval(() => {
-    pollGameState().catch(err => logger.debug('Game state poll error:', err));
-  }, 10_000);
-
-  // Pacing timer update: every 30s
-  pacingUpdateTimer = setInterval(() => {
-    pacing.updateElapsed();
-    if (triggers) {
-      triggers.checkPacingOverrun(config.sceneOverrunThresholdMinutes);
-    }
+  sessionWatchTimer = setInterval(() => {
+    pollForSession().catch(err => logger.debug('Session watch error:', err));
   }, 30_000);
 
-  logger.info('GM Assistant v3 ready — monitoring for triggers (PREGAME)');
+  // Check immediately on startup (don't wait 30s)
+  pollForSession().catch(err => logger.debug('Session watch error:', err));
+
+  logger.info('GM Assistant v4 ready — waiting for session');
 }
 
 main().catch((err) => {

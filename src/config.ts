@@ -46,6 +46,10 @@ export interface GmConfig {
   adviceMemorySize: number;
   npcCacheMaxBriefWords: number;
 
+  // Campaign identity (v4: used for wiki discovery)
+  campaignName: string;
+  campaignGroup: string;
+
   // Paths / data files
   systemPromptPath: string;
   campaignWikiCard: string;
@@ -180,6 +184,10 @@ export function getConfig(): GmConfig {
     adviceMaxTokens: parseInt10(process.env.ADVICE_MAX_TOKENS, 2048),
     adviceMemorySize: parseInt10(process.env.ADVICE_MEMORY_SIZE, 5),
     npcCacheMaxBriefWords: parseInt10(process.env.NPC_CACHE_MAX_BRIEF_WORDS, 60),
+
+    // Campaign identity (v4: used for wiki discovery)
+    campaignName: process.env.CAMPAIGN_NAME ?? '',
+    campaignGroup: process.env.CAMPAIGN_GROUP ?? 'Group 1',
 
     // Paths / data files
     systemPromptPath: process.env.SYSTEM_PROMPT_PATH ?? './prompts/system.md',
