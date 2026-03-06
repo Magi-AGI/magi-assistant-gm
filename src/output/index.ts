@@ -32,8 +32,9 @@ export class AdviceDelivery {
   /**
    * Deliver an advice envelope.
    * Tries Foundry first; falls back to Discord with [VIA DISCORD] tag on failure.
+   * Returns the channel used: 'foundry', 'discord', or 'none'.
    */
-  async deliver(envelope: AdviceEnvelope): Promise<void> {
+  async deliver(envelope: AdviceEnvelope): Promise<'foundry' | 'discord' | 'none'> {
     // Log advice body (truncated) at INFO level
     const bodyPreview = (envelope.body ?? '').slice(0, 200);
     logger.info(`AdviceDelivery: [${envelope.tag}] ${bodyPreview}${(envelope.body?.length ?? 0) > 200 ? '...' : ''}`);
@@ -52,7 +53,7 @@ export class AdviceDelivery {
         );
       }
       logger.info(`AdviceDelivery: delivered [${envelope.tag}] via Foundry`);
-      return;
+      return 'foundry';
     }
 
     // Foundry failed — handle status notifications
@@ -81,9 +82,11 @@ export class AdviceDelivery {
     const discordOk = await this.discord.deliver(envelope, true);
     if (discordOk) {
       logger.info(`AdviceDelivery: delivered [${envelope.tag}] via Discord (Foundry fallback)`);
-    } else {
-      logger.warn(`AdviceDelivery: failed to deliver [${envelope.tag}] to any output`);
+      return 'discord';
     }
+
+    logger.warn(`AdviceDelivery: failed to deliver [${envelope.tag}] to any output`);
+    return 'none';
   }
 
   /**

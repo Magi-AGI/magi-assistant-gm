@@ -27,14 +27,17 @@ import { AdviceMemoryBuffer } from './state/advice-memory.js';
 import { TriggerDetector, loadFuzzyMatchTable } from './reasoning/triggers.js';
 import { ReasoningEngine } from './reasoning/engine.js';
 import { extractMcpText } from './reasoning/context.js';
-import { runWikiDiscovery, formatReadinessReport } from './discovery/wiki-bootstrap.js';
+import { runWikiDiscovery, formatReadinessReport, type DiscoveryReport } from './discovery/wiki-bootstrap.js';
 import { NpcCacheBuilder } from './reasoning/npc-cache.js';
 import { SceneIndexBuilder } from './reasoning/scene-index.js';
 import { AdviceDelivery } from './output/index.js';
 import { ImageQueue } from './output/image-queue.js';
 import { parseGmCommand } from './state/gm-commands.js';
+import { createSessionStats, type SessionStats } from './qa/session-stats.js';
+import { runPostSessionQa, formatQaReport } from './qa/post-session.js';
 import { AssistantState } from './types/index.js';
 import type { ActivationSource, NpcCacheEntry, SceneIndexEntry } from './types/index.js';
+import type { FuzzyMatchTable } from './reasoning/triggers.js';
 
 const config = getConfig();
 
@@ -56,6 +59,11 @@ let activationBuildInProgress = false;
 
 // v4: Wiki discovery state
 let discoveredPlanCard: string | null = null;
+let lastDiscoveryReport: DiscoveryReport | null = null;
+let currentFuzzyTable: FuzzyMatchTable = {};
+
+// v4: Session stats (for post-session QA)
+let sessionStats: SessionStats = createSessionStats();
 
 // ── Polling state ──────────────────────────────────────────────────────────
 
@@ -155,8 +163,13 @@ function startSessionLoops(): void {
   sessionJustChanged = false;
   npcCache = [];
   sceneIndex = [];
+  sessionStats = createSessionStats();
+  sessionStats.sessionStartedAt = new Date().toISOString();
 
-  if (triggers) triggers.start();
+  if (triggers) {
+    triggers.resetSession();
+    triggers.start();
+  }
 
   // Start work timers
   transcriptPollTimer = setInterval(() => {
@@ -184,8 +197,9 @@ function startSessionLoops(): void {
 /**
  * Stop all work loops when the Discord session ends.
  * Called from pollTranscript() when no active session is found.
+ * v4: Runs post-session QA before resetting state.
  */
-function stopSessionLoops(): void {
+async function stopSessionLoops(): Promise<void> {
   if (!sessionActive) return;
   sessionActive = false;
 
@@ -195,6 +209,40 @@ function stopSessionLoops(): void {
   if (pacingUpdateTimer) { clearInterval(pacingUpdateTimer); pacingUpdateTimer = null; }
 
   if (triggers) triggers.stop();
+
+  // v4: Run post-session QA before resetting state
+  try {
+    const phoneticDiscoveries = triggers ? triggers.getPhoneticDiscoveries() : [];
+    const qaReport = await runPostSessionQa(
+      mcp,
+      transcriptCache.map(s => ({
+        text: s.text,
+        userId: s.userId,
+        displayName: s.displayName,
+        speakerLabel: s.speakerLabel,
+        timestamp: s.timestamp,
+      })),
+      sessionStats,
+      currentFuzzyTable,
+      phoneticDiscoveries,
+    );
+
+    // Merge persisted delta into in-memory fuzzy table so next session won't re-persist
+    if (qaReport.fuzzyTablePersisted && Object.keys(qaReport.fuzzyTableDelta).length > 0) {
+      for (const [key, value] of Object.entries(qaReport.fuzzyTableDelta)) {
+        currentFuzzyTable[key] = value;
+      }
+      logger.info(`PostSessionQA: merged ${Object.keys(qaReport.fuzzyTableDelta).length} new entries into in-memory fuzzy table`);
+    }
+
+    // Post QA summary to Discord + Foundry
+    if (delivery) {
+      const summary = formatQaReport(qaReport);
+      await delivery.postSystemMessage(summary);
+    }
+  } catch (err) {
+    logger.error('Post-session QA failed:', err);
+  }
 
   // Reset state
   transcriptCache.length = 0;
@@ -241,6 +289,15 @@ async function pollForSession(): Promise<void> {
   }
 }
 
+// ── v4: Delivery stats tracking ───────────────────────────────────────────
+
+function trackDelivery(channel: 'foundry' | 'discord' | 'none'): void {
+  if (channel === 'none') return;
+  sessionStats.adviceDelivered++;
+  if (channel === 'foundry') sessionStats.adviceViaFoundry++;
+  else if (channel === 'discord') sessionStats.adviceViaDiscord++;
+}
+
 // ── v3: ACTIVE Initialization ─────────────────────────────────────────────
 
 /**
@@ -276,6 +333,8 @@ async function handleActivation(source: ActivationSource): Promise<void> {
   // PREGAME → ACTIVE
   pacing.transitionTo(AssistantState.ACTIVE);
   pacing.setActivationSource(source);
+  sessionStats.activatedAt = new Date().toISOString();
+  sessionStats.activationSource = source;
   logger.info(`Orchestrator: PREGAME → ACTIVE (${source})`);
 
   // Set session end time from config if available
@@ -397,7 +456,7 @@ async function pollTranscript(): Promise<void> {
         const session = JSON.parse(sessionRaw);
         if (!session.active || !session.sessions?.length) {
           if (sessionActive) {
-            stopSessionLoops();
+            await stopSessionLoops();
           }
           return;
         }
@@ -420,7 +479,7 @@ async function pollTranscript(): Promise<void> {
 
     if (!sessionId) {
       if (sessionActive) {
-        stopSessionLoops();
+        await stopSessionLoops();
       }
       return;
     }
@@ -509,6 +568,13 @@ async function pollTranscript(): Promise<void> {
       transcriptCache.push(...mapped);
       if (transcriptCache.length > TRANSCRIPT_CACHE_SIZE) {
         transcriptCache.splice(0, transcriptCache.length - TRANSCRIPT_CACHE_SIZE);
+      }
+
+      // v4: Accumulate real-time transcript stats (survives ring buffer eviction)
+      for (const seg of mapped) {
+        sessionStats.totalSegmentCount++;
+        const speaker = seg.displayName ?? seg.speakerLabel ?? seg.userId ?? 'unknown';
+        sessionStats.speakerDistribution[speaker] = (sessionStats.speakerDistribution[speaker] ?? 0) + 1;
       }
 
       if (sessionJustChanged) {
@@ -750,6 +816,47 @@ function applyGmCommand(cmd: import('./types/index.js').GmCommand): void {
       }
       break;
     }
+
+    // v4 commands
+    case 'status': {
+      if (delivery) {
+        if (lastDiscoveryReport) {
+          const report = formatReadinessReport(lastDiscoveryReport, config);
+          delivery.postSystemMessage(report).catch(err => {
+            logger.warn('GM command: failed to post status:', err);
+          });
+        } else {
+          delivery.postSystemMessage('No discovery report available. Set CAMPAIGN_NAME to enable wiki discovery.').catch(() => {});
+        }
+      }
+      break;
+    }
+    case 'rediscover': {
+      if (!config.campaignName) {
+        logger.warn('GM command: /rediscover requires CAMPAIGN_NAME to be set');
+        break;
+      }
+      logger.info('GM command: re-running wiki discovery...');
+      runWikiDiscovery(mcp, config).then(async (discovery) => {
+        lastDiscoveryReport = discovery;
+        discoveredPlanCard = discovery.planCardName;
+        currentFuzzyTable = discovery.fuzzyTable;
+
+        // Hot-reload fuzzy table into trigger detector
+        if (triggers) {
+          triggers.reloadFuzzyTable(discovery.fuzzyTable);
+          logger.info('GM command: wiki discovery complete. Fuzzy table and plan card hot-reloaded.');
+        }
+
+        if (delivery) {
+          const report = formatReadinessReport(discovery, config);
+          await delivery.postSystemMessage(`Rediscovery complete:\n${report}`);
+        }
+      }).catch(err => {
+        logger.error('GM command: /rediscover failed:', err);
+      });
+      break;
+    }
   }
 }
 
@@ -824,8 +931,10 @@ async function main(): Promise<void> {
 
   if (config.campaignName) {
     const discovery = await runWikiDiscovery(mcp, config);
+    lastDiscoveryReport = discovery;
     discoveredPlanCard = discovery.planCardName;
     fuzzyTable = discovery.fuzzyTable;
+    currentFuzzyTable = discovery.fuzzyTable;
 
     // Apply session end time from plan card (config override takes precedence)
     if (!config.sessionEndTime && discovery.sessionEndTime) {
@@ -864,6 +973,7 @@ async function main(): Promise<void> {
 
     // Load static fuzzy table (legacy behavior when wiki discovery is skipped)
     fuzzyTable = loadFuzzyMatchTable(config.sttFuzzyMatchPath);
+    currentFuzzyTable = fuzzyTable;
     if (Object.keys(fuzzyTable).length > 0) {
       logger.info(`  Static fuzzy table loaded: ${Object.keys(fuzzyTable).length} terms from ${config.sttFuzzyMatchPath}`);
     }
@@ -913,7 +1023,10 @@ async function main(): Promise<void> {
       if (envelope.image) {
         imageQueue.setPending(envelope.image);
       }
-      await delivery.deliver(envelope);
+      const channel = await delivery.deliver(envelope);
+      trackDelivery(channel);
+    } else {
+      sessionStats.adviceSuppressed++;
     }
   });
 
@@ -923,7 +1036,8 @@ async function main(): Promise<void> {
       if (envelope.image) {
         imageQueue.setPending(envelope.image);
       }
-      await delivery.deliver(envelope);
+      const channel = await delivery.deliver(envelope);
+      trackDelivery(channel);
     }
   });
 

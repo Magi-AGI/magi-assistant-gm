@@ -212,8 +212,10 @@ export type GmCommandType =
   | 'seed'
   | 'sleep'
   | 'wake'
-  | 'endtime'  // v3: set session end time for pacing gates
-  | 'npc';     // v3: /npc refresh, /npc serve [name]
+  | 'endtime'    // v3: set session end time for pacing gates
+  | 'npc'        // v3: /npc refresh, /npc serve [name]
+  | 'status'     // v4: re-post readiness report
+  | 'rediscover'; // v4: re-run wiki discovery
 
 export interface GmCommand {
   type: GmCommandType;

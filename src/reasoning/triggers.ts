@@ -67,6 +67,7 @@ const ACT_TRANSITION_KEYWORDS = [
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const MAX_PENDING_EVENTS = 100;
+const MAX_PHONETIC_DISCOVERIES = 500;
 
 const FLOWING_RP_MIN_SPEAKERS = 2;
 const FLOWING_RP_MIN_SEGMENTS = 4;
@@ -201,6 +202,11 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
   /** Track accumulated keyword matches per scene within a rolling window. */
   private sceneMatchState = new Map<string, { keywords: Set<string>; windowStart: number }>();
 
+  // ── v4: Phonetic match collection (for post-session QA) ────────────────
+
+  /** Phonetic matches discovered during this session (garble → canonical). */
+  private _phoneticDiscoveries: Array<{ input: string; canonical: string; similarity: number }> = [];
+
   // ── v3: Pacing gates state ─────────────────────────────────────────────
 
   private convergenceGateFired = false;
@@ -303,6 +309,54 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
 
   getFuzzyTable(): FuzzyMatchTable {
     return this.fuzzyTable;
+  }
+
+  /**
+   * v4: Hot-reload the fuzzy table (e.g. after /rediscover).
+   * Rebuilds activation dictionary and phonetic index with the new terms.
+   */
+  reloadFuzzyTable(newTable: FuzzyMatchTable): void {
+    this.fuzzyTable = newTable;
+    const config = getConfig();
+    this.activationDict = buildActivationDictionary(
+      this.fuzzyTable,
+      config.autoActiveMinTermLength,
+    );
+    // Rebuild phonetic index: canonical terms from activation dict + existing NPC terms
+    const canonicalTerms = new Set<string>();
+    for (const entry of this.activationDict.values()) {
+      canonicalTerms.add(entry.canonical);
+    }
+    // Re-add NPC names/aliases
+    for (const npc of this.npcCache) {
+      canonicalTerms.add(npc.key);
+      for (const alias of npc.aliases) {
+        if (alias.length >= 3) canonicalTerms.add(alias);
+      }
+    }
+    this.phoneticMatcher = new PhoneticMatcher(canonicalTerms);
+    logger.info(`TriggerDetector: fuzzy table reloaded (${this.activationDict.size} activation terms, ${canonicalTerms.size} phonetic terms)`);
+  }
+
+  /** v4: Get phonetic matches discovered during this session (for post-session QA). */
+  getPhoneticDiscoveries(): Array<{ input: string; canonical: string; similarity: number }> {
+    return [...this._phoneticDiscoveries];
+  }
+
+  /** v4: Reset session-scoped state (phonetic discoveries, activation window, pacing gates). */
+  resetSession(): void {
+    this._phoneticDiscoveries = [];
+    this.activationWindow = [];
+    this.convergenceGateFired = false;
+    this.convergenceEscalationFired = false;
+    this.denouementGateFired = false;
+    this.lastGmSpeechTime = 0;
+    this.silenceAlertFired = false;
+    this.lastHesitationTime = 0;
+    this.lastHesitationText = '';
+    this.hesitationFired = false;
+    this.recentSegments = [];
+    this.sceneMatchState.clear();
   }
 
   /**
@@ -496,6 +550,9 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
         if (!matchedCanonicals.has(pm.canonical)) {
           matchedCanonicals.add(pm.canonical);
           this.activationWindow.push({ canonical: pm.canonical, timestamp: now, weight: 0.5 });
+          if (this._phoneticDiscoveries.length < MAX_PHONETIC_DISCOVERIES) {
+            this._phoneticDiscoveries.push({ input: pm.input, canonical: pm.canonical, similarity: pm.similarity });
+          }
           logger.debug(`TriggerDetector: phonetic match "${pm.input}" → "${pm.canonical}" (${pm.similarity.toFixed(2)} ${pm.matchType})`);
         }
       }
@@ -559,6 +616,9 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
         );
         if (pm) {
           matched = true;
+          if (this._phoneticDiscoveries.length < MAX_PHONETIC_DISCOVERIES) {
+            this._phoneticDiscoveries.push({ input: pm.input, canonical: pm.canonical, similarity: pm.similarity });
+          }
           logger.info(`TriggerDetector: NPC phonetic match "${pm.input}" → "${npc.display_name}" (${pm.similarity.toFixed(2)})`);
         }
       }
