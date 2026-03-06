@@ -1,5 +1,5 @@
 /**
- * v3 Trigger detection and batching system.
+ * v4 Trigger detection and batching system.
  *
  * v2 base: P1-P4 priority triggers, PREGAME/ACTIVE/SLEEP state machine,
  * flowing-RP suppression, 30s batch window (P1 flushes immediately),
@@ -10,12 +10,19 @@
  * - NPC first-appearance: P2 trigger on first mention of a cached NPC
  * - Scene keyword matching: P2 trigger when transcript matches scene index
  * - Pacing gates: P2 convergence/denouement triggers on wall-clock time
+ *
+ * v4 additions:
+ * - 3-layer matching pipeline: exact → fuzzy table → phonetic (talisman)
+ * - Phonetic matches use Double Metaphone + Jaro-Winkler similarity
+ * - Auto-ACTIVE: phonetic matches count at 0.5 weight (6 needed vs 3 exact)
+ * - NPC first-appearance: phonetic matching with higher threshold (≥0.8)
  */
 
 import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'events';
 import { logger } from '../logger.js';
 import { getConfig } from '../config.js';
+import { PhoneticMatcher } from '../matching/phonetic.js';
 import type { PacingStateManager } from '../state/pacing.js';
 import type { NpcCacheEntry, SceneIndexEntry, ActivationSource } from '../types/index.js';
 import {
@@ -179,8 +186,10 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
   private fuzzyTable: FuzzyMatchTable = {};
   /** Map: search term (lowercase) → { canonical, pre-compiled pattern }. */
   private activationDict = new Map<string, ActivationEntry>();
+  /** v4: Phonetic matcher for Layer 3 (Double Metaphone + Jaro-Winkler). */
+  private phoneticMatcher: PhoneticMatcher;
   /** Rolling window of detected canonical terms with timestamps. */
-  private activationWindow: Array<{ canonical: string; timestamp: number }> = [];
+  private activationWindow: Array<{ canonical: string; timestamp: number; weight: number }> = [];
   private readonly autoActiveEnabled: boolean;
   private readonly autoActiveWindowMs: number;
   private readonly autoActiveThreshold: number;
@@ -229,6 +238,13 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
     if (this.activationDict.size > 0) {
       logger.info(`TriggerDetector: activation dictionary has ${this.activationDict.size} terms`);
     }
+
+    // v4: Build phonetic index from canonical terms in the activation dictionary
+    const canonicalTerms = new Set<string>();
+    for (const entry of this.activationDict.values()) {
+      canonicalTerms.add(entry.canonical);
+    }
+    this.phoneticMatcher = new PhoneticMatcher(canonicalTerms);
   }
 
   start(): void {
@@ -268,6 +284,15 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
 
   setNpcCache(cache: NpcCacheEntry[]): void {
     this.npcCache = cache;
+    // v4: Add NPC names and aliases to phonetic index for Layer 3 matching
+    const npcTerms = new Set<string>();
+    for (const npc of cache) {
+      npcTerms.add(npc.key);
+      for (const alias of npc.aliases) {
+        if (alias.length >= 3) npcTerms.add(alias);
+      }
+    }
+    this.phoneticMatcher.addTerms(npcTerms);
     logger.info(`TriggerDetector: NPC cache loaded (${cache.length} entries)`);
   }
 
@@ -444,16 +469,35 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
 
   /**
    * Check if transcript segment contains campaign proper nouns.
-   * When ≥threshold distinct terms are detected in the rolling window,
+   * When ≥threshold weighted distinct terms are detected in the rolling window,
    * emit 'activated' so the orchestrator can transition to ACTIVE.
+   *
+   * v4: 3-layer matching pipeline:
+   *   Layer 1: Exact match (word-boundary regex against activation dictionary)
+   *   Layer 2: Fuzzy table match (handled by activation dictionary which includes garbled forms)
+   *   Layer 3: Phonetic similarity (Double Metaphone + Jaro-Winkler, 0.5 weight)
    */
   private checkAutoActive(text: string, now: number): void {
     const textLower = text.toLowerCase();
+    const matchedCanonicals = new Set<string>();
 
-    // Check each activation term against the text (pre-compiled word-boundary regex)
+    // Layer 1+2: Exact + fuzzy table match (pre-compiled word-boundary regex)
     for (const [, entry] of this.activationDict) {
       if (entry.pattern.test(textLower)) {
-        this.activationWindow.push({ canonical: entry.canonical, timestamp: now });
+        matchedCanonicals.add(entry.canonical);
+        this.activationWindow.push({ canonical: entry.canonical, timestamp: now, weight: 1.0 });
+      }
+    }
+
+    // Layer 3: Phonetic matching on unmatched words (0.5 weight per v4 plan)
+    if (this.phoneticMatcher.size > 0) {
+      const phoneticMatches = this.phoneticMatcher.matchSegment(textLower, 0.6);
+      for (const pm of phoneticMatches) {
+        if (!matchedCanonicals.has(pm.canonical)) {
+          matchedCanonicals.add(pm.canonical);
+          this.activationWindow.push({ canonical: pm.canonical, timestamp: now, weight: 0.5 });
+          logger.debug(`TriggerDetector: phonetic match "${pm.input}" → "${pm.canonical}" (${pm.similarity.toFixed(2)} ${pm.matchType})`);
+        }
       }
     }
 
@@ -461,11 +505,17 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
     const windowCutoff = now - this.autoActiveWindowMs;
     this.activationWindow = this.activationWindow.filter(e => e.timestamp > windowCutoff);
 
-    // Count distinct canonical terms in the window
-    const distinctTerms = new Set(this.activationWindow.map(e => e.canonical));
-    if (distinctTerms.size >= this.autoActiveThreshold) {
-      const terms = [...distinctTerms].join(', ');
-      logger.info(`TriggerDetector: auto-ACTIVE triggered (${distinctTerms.size} terms: ${terms})`);
+    // Count weighted distinct terms in the window
+    const termWeights = new Map<string, number>();
+    for (const entry of this.activationWindow) {
+      const existing = termWeights.get(entry.canonical) ?? 0;
+      termWeights.set(entry.canonical, Math.max(existing, entry.weight));
+    }
+    const weightedScore = [...termWeights.values()].reduce((sum, w) => sum + w, 0);
+
+    if (weightedScore >= this.autoActiveThreshold) {
+      const terms = [...termWeights.entries()].map(([t, w]) => w < 1 ? `${t}(~)` : t).join(', ');
+      logger.info(`TriggerDetector: auto-ACTIVE triggered (score ${weightedScore.toFixed(1)}, terms: ${terms})`);
       this.activationWindow = []; // Reset window
       this.emit('activated', 'transcript' as ActivationSource);
     }
@@ -475,23 +525,45 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
 
   /**
    * Check if any unserved NPC from the cache is mentioned in this segment.
-   * Matches against display name, key, and aliases (including fuzzy match forms).
+   *
+   * v4: 3-layer matching pipeline:
+   *   Layer 1: Exact match against display name, key, and aliases (word-boundary regex)
+   *   Layer 2: Fuzzy table match (garbled forms that map to this NPC's key)
+   *   Layer 3: Phonetic similarity (Double Metaphone + Jaro-Winkler, ≥0.8 threshold)
    */
   private checkNpcFirstAppearance(text: string, timestamp: string): void {
     const textLower = text.toLowerCase();
 
+    // Layer 3: Compute phonetic matches once for the whole segment (not per-NPC)
+    const phoneticMatches = this.phoneticMatcher.size > 0
+      ? this.phoneticMatcher.matchSegment(textLower, 0.8)
+      : [];
+
     for (const npc of this.npcCache) {
       if (npc.served) continue;
 
-      // Check against all aliases with word boundaries (prevents "vel" matching "velvet")
-      const matched = npc.aliases.some(alias => wordBoundaryRegex(alias).test(textLower));
+      // Layer 1: Exact match against all aliases with word boundaries
+      let matched = npc.aliases.some(alias => wordBoundaryRegex(alias).test(textLower));
+
+      // Layer 2: Fuzzy match table (garbled forms that map to this NPC)
       if (!matched) {
-        // Also check fuzzy match table: garbled forms that map to this NPC
-        const fuzzyMatched = Object.entries(this.fuzzyTable).some(
+        matched = Object.entries(this.fuzzyTable).some(
           ([garbled, canonical]) => canonical === npc.key && wordBoundaryRegex(garbled).test(textLower)
         );
-        if (!fuzzyMatched) continue;
       }
+
+      // Layer 3: Phonetic matching (higher threshold — ≥0.8 to avoid false NPC serves)
+      if (!matched && phoneticMatches.length > 0) {
+        const pm = phoneticMatches.find(m =>
+          m.canonical === npc.key || npc.aliases.includes(m.canonical)
+        );
+        if (pm) {
+          matched = true;
+          logger.info(`TriggerDetector: NPC phonetic match "${pm.input}" → "${npc.display_name}" (${pm.similarity.toFixed(2)})`);
+        }
+      }
+
+      if (!matched) continue;
 
       npc.served = true;
       npc.last_served_at = new Date().toISOString();
