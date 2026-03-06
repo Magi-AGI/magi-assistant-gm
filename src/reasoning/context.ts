@@ -41,6 +41,7 @@ const BUDGET_ALREADY_ADVISED = 1500;
 const BUDGET_NPC_CACHE = 500;
 const BUDGET_SCENE_CARD = 1500;
 const BUDGET_NPC_CARD = 800;
+const BUDGET_GM_NOTES = 500;
 const BUDGET_RESPONSE_RESERVE = 2000;
 
 // ── MCP result extraction ─────────────────────────────────────────────────
@@ -73,10 +74,16 @@ function extractCardHtml(result: unknown): string | null {
   return text;
 }
 
+export interface GmNote {
+  text: string;
+  timestamp: string;
+}
+
 export class ContextAssembler {
   private systemPromptTemplate: string = '';
   private npcCache: NpcCacheEntry[] = [];
   private sceneIndex: SceneIndexEntry[] = [];
+  private gmNotes: GmNote[] = [];
 
   constructor(
     private mcp: McpAggregator,
@@ -90,6 +97,10 @@ export class ContextAssembler {
 
   setSceneIndex(index: SceneIndexEntry[]): void {
     this.sceneIndex = index;
+  }
+
+  setGmNotes(notes: GmNote[]): void {
+    this.gmNotes = notes;
   }
 
   /**
@@ -194,6 +205,7 @@ export class ContextAssembler {
     const advisedBlock = this.buildAlreadyAdvisedBlock();
     const freshnessBlock = this.buildFreshnessWarnings();
     const mappingsText = this.buildMappingsText();
+    const gmNotesBlock = this.buildGmNotesBlock();
 
     // ── Tool definitions (computed early — needed for budget) ──────────
 
@@ -218,6 +230,7 @@ export class ContextAssembler {
       estimateTokens(advisedBlock) +
       estimateTokens(freshnessBlock) +
       estimateTokens(mappingsText) +
+      estimateTokens(gmNotesBlock) +
       toolTokens;
 
     const availableForTranscript = Math.max(0, maxTokens - fixedTokens - BUDGET_RESPONSE_RESERVE);
@@ -242,6 +255,7 @@ export class ContextAssembler {
 
     const contextParts = [
       `## Trigger\n${triggerSummary}`,
+      gmNotesBlock ? `## GM Notes\nDirect instructions from the GM. Treat these as high-priority context.\n\n${gmNotesBlock}` : '',
       freshnessBlock ? `## Data Freshness\n${freshnessBlock}` : '',
       `## Pacing State\n${pacingBlock}`,
       `## Episode Plan (Current Act)\n${episodeBlock}`,
@@ -379,6 +393,12 @@ export class ContextAssembler {
     return Object.entries(mappings)
       .map(([discord, character]) => `- ${discord} → ${character}`)
       .join('\n');
+  }
+
+  private buildGmNotesBlock(): string {
+    if (this.gmNotes.length === 0) return '';
+    const lines = this.gmNotes.map(n => `[${n.timestamp}] ${n.text}`);
+    return this.truncateToTokens(lines.join('\n'), BUDGET_GM_NOTES);
   }
 
   // ── Transcript Builder ──────────────────────────────────────────────────

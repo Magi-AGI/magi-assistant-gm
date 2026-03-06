@@ -8,7 +8,7 @@ import { EventEmitter } from 'events';
 import Anthropic from '@anthropic-ai/sdk';
 import { getConfig } from '../config.js';
 import { logger } from '../logger.js';
-import { ContextAssembler } from './context.js';
+import { ContextAssembler, type GmNote } from './context.js';
 import { parseAdviceEnvelope, wrapFreeTextAsEnvelope, isNoAdvice } from './envelope-parser.js';
 import type { McpAggregator } from '../mcp/client.js';
 import type { PacingStateManager } from '../state/pacing.js';
@@ -60,6 +60,11 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
   /** Forward scene index to the context assembler for injection into context. */
   setSceneIndex(index: SceneIndexEntry[]): void {
     this.assembler.setSceneIndex(index);
+  }
+
+  /** Forward GM notes to the context assembler for injection into context. */
+  setGmNotes(notes: GmNote[]): void {
+    this.assembler.setGmNotes(notes);
   }
 
   /**

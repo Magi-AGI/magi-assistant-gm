@@ -215,7 +215,9 @@ export type GmCommandType =
   | 'endtime'    // v3: set session end time for pacing gates
   | 'npc'        // v3: /npc refresh, /npc serve [name]
   | 'status'     // v4: re-post readiness report
-  | 'rediscover'; // v4: re-run wiki discovery
+  | 'rediscover' // v4: re-run wiki discovery
+  | 'plan'       // v4: override session plan card
+  | 'note';      // v4: inject GM note into reasoning context
 
 export interface GmCommand {
   type: GmCommandType;

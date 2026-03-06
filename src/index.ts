@@ -65,6 +65,11 @@ let currentFuzzyTable: FuzzyMatchTable = {};
 // v4: Session stats (for post-session QA)
 let sessionStats: SessionStats = createSessionStats();
 
+// v4: GM notes buffer (injected into reasoning context)
+const MAX_GM_NOTES = 10;
+interface GmNoteEntry { text: string; timestamp: string }
+let gmNotes: GmNoteEntry[] = [];
+
 // ── Polling state ──────────────────────────────────────────────────────────
 
 let sessionWatchTimer: ReturnType<typeof setInterval> | null = null;
@@ -163,9 +168,11 @@ function startSessionLoops(): void {
   sessionJustChanged = false;
   npcCache = [];
   sceneIndex = [];
+  gmNotes = [];
   sessionStats = createSessionStats();
   sessionStats.sessionStartedAt = new Date().toISOString();
 
+  if (engine) engine.setGmNotes([]);
   if (triggers) {
     triggers.resetSession();
     triggers.start();
@@ -296,6 +303,17 @@ function trackDelivery(channel: 'foundry' | 'discord' | 'none'): void {
   sessionStats.adviceDelivered++;
   if (channel === 'foundry') sessionStats.adviceViaFoundry++;
   else if (channel === 'discord') sessionStats.adviceViaDiscord++;
+}
+
+// ── v4: GM notes ──────────────────────────────────────────────────────────
+
+function addGmNote(text: string, timestamp: string): void {
+  gmNotes.push({ text, timestamp });
+  if (gmNotes.length > MAX_GM_NOTES) {
+    gmNotes.splice(0, gmNotes.length - MAX_GM_NOTES);
+  }
+  if (engine) engine.setGmNotes([...gmNotes]);
+  logger.info(`GM note added: "${text.slice(0, 100)}${text.length > 100 ? '...' : ''}"`);
 }
 
 // ── v3: ACTIVE Initialization ─────────────────────────────────────────────
@@ -598,7 +616,7 @@ async function pollTranscript(): Promise<void> {
         }
       }
     }
-    // Text events polling (image queue /yes /no)
+    // Text events polling (image queue, GM commands, @magi notes)
     if (lastSessionId) {
       try {
         const textRaw = await mcp.readResource('discord', `session://${lastSessionId}/text-events`);
@@ -607,15 +625,21 @@ async function pollTranscript(): Promise<void> {
             id?: number;
             content?: string;
             eventType?: string;
+            authorId?: string;
+            authorName?: string;
           }>;
+          const gmId = config.gmIdentifier?.toLowerCase();
           for (const evt of textEvents) {
             const evtId = evt.id ?? 0;
             if (evtId <= lastTextEventId) continue;
             lastTextEventId = evtId;
 
             if (evt.eventType !== 'create') continue;
-            const content = evt.content?.trim().toLowerCase();
-            if (content === '/yes' && imageQueue.hasPending()) {
+            const rawContent = evt.content?.trim() ?? '';
+            const contentLower = rawContent.toLowerCase();
+
+            // Image queue confirmation (GM-only not enforced — low risk)
+            if (contentLower === '/yes' && imageQueue.hasPending()) {
               const suggestion = imageQueue.confirm();
               if (suggestion && mcp.isConnected('discord')) {
                 try {
@@ -629,8 +653,23 @@ async function pollTranscript(): Promise<void> {
                   logger.warn('Failed to post image:', err);
                 }
               }
-            } else if (content === '/no' && imageQueue.hasPending()) {
+            } else if (contentLower === '/no' && imageQueue.hasPending()) {
               imageQueue.reject();
+            }
+
+            // GM commands from Discord text (/plan, /note, @magi, etc.)
+            // Filter: only accept from GM if gmIdentifier is configured and author info is available
+            const cmd = parseGmCommand(rawContent, new Date().toISOString());
+            if (cmd) {
+              const evtAuthorId = evt.authorId?.toLowerCase();
+              const evtAuthorName = evt.authorName?.toLowerCase();
+              const isGm = !gmId || !evtAuthorId && !evtAuthorName
+                || evtAuthorId === gmId || evtAuthorName === gmId;
+              if (!isGm) {
+                logger.debug(`Discord text: ignoring command from non-GM "${evtAuthorName ?? evtAuthorId}"`);
+              } else {
+                applyGmCommand(cmd);
+              }
             }
           }
         }
@@ -855,6 +894,67 @@ function applyGmCommand(cmd: import('./types/index.js').GmCommand): void {
       }).catch(err => {
         logger.error('GM command: /rediscover failed:', err);
       });
+      break;
+    }
+    case 'plan': {
+      const cardName = cmd.args[0];
+      if (!cardName) {
+        logger.warn('GM command: /plan requires a card name');
+        break;
+      }
+      logger.info(`GM command: /plan "${cardName}" — validating...`);
+      mcp.callTool('wiki__get_card', { name: cardName, max_content_length: 100 })
+        .then(async (result) => {
+          // Unwrap MCP envelope → JSON card envelope → check actual HTML content
+          const mcpText = extractMcpText(result);
+          if (!mcpText) {
+            logger.warn(`GM command: /plan card "${cardName}" returned empty MCP result`);
+            if (delivery) await delivery.postSystemMessage(`Plan card "${cardName}" not found or empty.`);
+            return;
+          }
+          let cardContent = mcpText;
+          try {
+            const parsed = JSON.parse(mcpText);
+            if (typeof parsed === 'object' && parsed !== null && typeof parsed.text === 'string') {
+              cardContent = parsed.text;
+            }
+          } catch { /* not JSON — use raw */ }
+          if (!cardContent || cardContent.trim().length === 0) {
+            logger.warn(`GM command: /plan card "${cardName}" exists but is empty`);
+            if (delivery) await delivery.postSystemMessage(`Plan card "${cardName}" exists but has no content.`);
+            return;
+          }
+          discoveredPlanCard = cardName;
+          logger.info(`GM command: session plan set to "${cardName}"`);
+          if (delivery) {
+            await delivery.postSystemMessage(`Session plan set to: ${cardName}`);
+          }
+          // Rebuild caches with new plan card
+          if (!activationBuildInProgress && pacing.assistantState === AssistantState.ACTIVE) {
+            activationBuildInProgress = true;
+            buildActivationCaches(cardName).catch(err => {
+              logger.error('GM command: /plan cache rebuild failed:', err);
+            }).finally(() => {
+              activationBuildInProgress = false;
+            });
+          }
+        })
+        .catch(async (err) => {
+          logger.warn(`GM command: /plan card "${cardName}" not found:`, err);
+          if (delivery) await delivery.postSystemMessage(`Plan card not found: "${cardName}". Check the card name.`);
+        });
+      break;
+    }
+    case 'note': {
+      const noteText = cmd.args[0];
+      if (!noteText) {
+        logger.warn('GM command: /note requires text');
+        break;
+      }
+      addGmNote(noteText, cmd.timestamp);
+      if (delivery) {
+        delivery.postSystemMessage(`Note received (${gmNotes.length}/${MAX_GM_NOTES}): ${noteText.slice(0, 80)}${noteText.length > 80 ? '...' : ''}`).catch(() => {});
+      }
       break;
     }
   }
