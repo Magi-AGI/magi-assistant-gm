@@ -743,8 +743,8 @@ async function pollGameState(): Promise<void> {
         lastSeenChatMsgId = chat[chat.length - 1].id ?? lastSeenChatMsgId;
       }
     }
-  } catch {
-    // Foundry state may not be available
+  } catch (err) {
+    logger.debug('Foundry game state poll error (non-fatal):', err);
   } finally {
     gameStatePollInFlight = false;
   }
@@ -966,7 +966,14 @@ function applyGmCommand(cmd: import('./types/index.js').GmCommand): void {
 // ── Startup ────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  logger.info('Magi GM Assistant v4 starting...');
+  // v6 WS8: Log git commit hash at startup for version tracing
+  let gitCommit = 'unknown';
+  try {
+    const { execSync } = await import('child_process');
+    gitCommit = execSync('git rev-parse --short HEAD', { encoding: 'utf-8' }).trim();
+  } catch { /* not in a git repo or git not available */ }
+
+  logger.info(`Magi GM Assistant v6 starting... (${gitCommit})`);
   logger.info(`  Model: ${config.anthropicModel}`);
   logger.info(`  Discord MCP: ${config.discordMcpUrl}`);
   logger.info(`  Foundry MCP: ${config.foundryMcpUrl}`);
@@ -1155,7 +1162,7 @@ async function main(): Promise<void> {
   // Check immediately on startup (don't wait 30s)
   pollForSession().catch(err => logger.debug('Session watch error:', err));
 
-  logger.info('GM Assistant v4 ready — waiting for session');
+  logger.info(`GM Assistant v6 ready — waiting for session (${gitCommit})`);
 }
 
 main().catch((err) => {
