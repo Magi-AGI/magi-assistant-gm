@@ -41,6 +41,7 @@ const BUDGET_ALREADY_ADVISED = 1500;
 const BUDGET_NPC_CACHE = 500;
 const BUDGET_SCENE_CARD = 1500;
 const BUDGET_NPC_CARD = 800;
+const BUDGET_UPCOMING_SCENE = 800;
 const BUDGET_GM_NOTES = 500;
 const BUDGET_RESPONSE_RESERVE = 2000;
 
@@ -151,13 +152,19 @@ export class ContextAssembler {
     const sceneCardPath = sceneEvent?.data.scene_card as string | undefined;
     const npcCardPath = npcEvent?.data.npc_card as string | undefined;
 
-    const [gameStateRaw, episodePlanRaw, sceneCardRaw, npcCardRaw] = await Promise.allSettled([
+    // v6: Find the next unserved scene for look-ahead (anticipatory guidance)
+    const upcomingScene = this.sceneIndex.find(s => !s.served && s.card);
+    const upcomingScenePath = upcomingScene?.card;
+
+    const [gameStateRaw, episodePlanRaw, sceneCardRaw, npcCardRaw, upcomingSceneRaw] = await Promise.allSettled([
       this.mcp.readResource('foundry', 'game://state'),
       config.campaignWikiCard && this.mcp.isConnected('wiki')
         ? this.fetchWikiCard(config.campaignWikiCard).then(t => t ?? '')
         : Promise.resolve(''),
       sceneCardPath ? this.fetchWikiCard(sceneCardPath) : Promise.resolve(null),
       npcCardPath ? this.fetchWikiCard(npcCardPath) : Promise.resolve(null),
+      // v6: Pre-fetch next unserved scene for anticipatory guidance
+      upcomingScenePath && !sceneCardPath ? this.fetchWikiCard(upcomingScenePath) : Promise.resolve(null),
     ]);
 
     let gameState = gameStateRaw.status === 'fulfilled' ? gameStateRaw.value : '{}';
@@ -175,6 +182,16 @@ export class ContextAssembler {
       const name = npcEvent!.data.npc_name as string;
       npcCardBlock = this.truncateToTokens(`NPC: ${name}\n\n${npcCardRaw.value}`, BUDGET_NPC_CARD);
       logger.info(`ContextAssembler: pre-fetched NPC card "${npcCardPath}" (~${estimateTokens(npcCardBlock)} tokens)`);
+    }
+
+    // v6: Build upcoming scene block (look-ahead for anticipatory guidance)
+    let upcomingSceneBlock = '';
+    if (upcomingSceneRaw.status === 'fulfilled' && upcomingSceneRaw.value && upcomingScene) {
+      upcomingSceneBlock = this.truncateToTokens(
+        `Next Scene: ${upcomingScene.title}\n\n${upcomingSceneRaw.value}`,
+        BUDGET_UPCOMING_SCENE,
+      );
+      logger.info(`ContextAssembler: pre-fetched upcoming scene "${upcomingScene.title}" (~${estimateTokens(upcomingSceneBlock)} tokens)`);
     }
 
     // Check Foundry connectivity
@@ -227,6 +244,7 @@ export class ContextAssembler {
       estimateTokens(npcBlock) +
       estimateTokens(sceneCardBlock) +
       estimateTokens(npcCardBlock) +
+      estimateTokens(upcomingSceneBlock) +
       estimateTokens(advisedBlock) +
       estimateTokens(freshnessBlock) +
       estimateTokens(mappingsText) +
@@ -261,6 +279,7 @@ export class ContextAssembler {
       `## Episode Plan (Current Act)\n${episodeBlock}`,
       sceneCardBlock ? `## Pre-Fetched Scene Card\nFull content from the matched scene card. Use this for read-aloud text, objectives, and setup notes.\n\n${sceneCardBlock}` : '',
       npcCardBlock ? `## Pre-Fetched NPC Card\nFull character card for the NPC just mentioned. Use this for voice, personality, and relationships.\n\n${npcCardBlock}` : '',
+      upcomingSceneBlock ? `## Upcoming Scene (Look-Ahead)\nThis is the next unplayed scene from the episode plan. Use it to anticipate what the GM will need — surface key details, NPC notes, and setting descriptions BEFORE the transition happens.\n\n${upcomingSceneBlock}` : '',
       `## Character Roster\n${rosterBlock}`,
       npcBlock ? `## NPC Reference (Pre-Cached)\n${npcBlock}` : '',
       mappingsText ? `## Player Identity Mappings\n${mappingsText}` : '',
