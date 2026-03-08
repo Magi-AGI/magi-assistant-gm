@@ -663,18 +663,21 @@ async function pollTranscript(): Promise<void> {
             if (cmd) {
               const evtAuthorId = evt.authorId?.toLowerCase();
               const evtAuthorName = evt.authorName?.toLowerCase();
-              const isGm = !gmId || !evtAuthorId && !evtAuthorName
-                || evtAuthorId === gmId || evtAuthorName === gmId;
+              // v6: Fixed identity check — missing author info now rejects (not accepts)
+              const isGm = !gmId
+                || evtAuthorId === gmId
+                || evtAuthorName === gmId;
               if (!isGm) {
-                logger.debug(`Discord text: ignoring command from non-GM "${evtAuthorName ?? evtAuthorId}"`);
+                logger.debug(`Discord text: ignoring command from non-GM "${evtAuthorName ?? evtAuthorId ?? 'unknown'}"`);
               } else {
+                logger.info(`GM command received: ${cmd.type} from ${evtAuthorName ?? evtAuthorId ?? 'unknown'}`);
                 applyGmCommand(cmd);
               }
             }
           }
         }
-      } catch {
-        // Text events may not be available — non-fatal
+      } catch (textErr) {
+        logger.warn('Text event poll error (non-fatal):', textErr);
       }
     }
   } catch (err) {
