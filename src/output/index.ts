@@ -10,6 +10,7 @@
  * 5. On Foundry reconnection: post recovery notice to Discord.
  */
 
+import { getConfig } from '../config.js';
 import { logger } from '../logger.js';
 import { FoundryAdviceOutput } from './foundry-sidebar.js';
 import { DiscordChannelOutput } from './discord-channel.js';
@@ -38,6 +39,12 @@ export class AdviceDelivery {
     // Log advice body (truncated) at INFO level
     const bodyPreview = (envelope.body ?? '').slice(0, 200);
     logger.info(`AdviceDelivery: [${envelope.tag}] ${bodyPreview}${(envelope.body?.length ?? 0) > 200 ? '...' : ''}`);
+
+    // Dry-run mode: log what would be delivered but don't actually send
+    if (getConfig().dryRun) {
+      logger.info(`AdviceDelivery: [DRY-RUN] would deliver [${envelope.tag}] (${envelope.category}, confidence=${envelope.confidence})`);
+      return 'foundry'; // Pretend success so the pipeline continues normally
+    }
 
     // Try Foundry first
     const foundryOk = await this.foundry.deliver(envelope);
@@ -94,6 +101,12 @@ export class AdviceDelivery {
    * Returns true if at least one channel succeeded.
    */
   async postSystemMessage(message: string): Promise<boolean> {
+    if (getConfig().dryRun) {
+      const preview = message.slice(0, 150);
+      logger.info(`AdviceDelivery: [DRY-RUN] would post system message: ${preview}${message.length > 150 ? '...' : ''}`);
+      return true;
+    }
+
     const results = await Promise.allSettled([
       this.discord.deliverSystemMessage(message),
       this.foundry.deliverSystemMessage(message),

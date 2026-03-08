@@ -62,6 +62,9 @@ export interface GmConfig {
   statePersistencePath: string;
   statePersistenceMaxAgeMinutes: number;
 
+  /** Dry-run mode: run the full pipeline but suppress delivery, wiki writes, and image posting. */
+  dryRun: boolean;
+
   /** Discord username -> Foundry character name mappings (JSON object or empty string). */
   userMappings: Record<string, string>;
   /** Target Discord guild ID - selects which session to track when multiple are active. */
@@ -199,6 +202,8 @@ export function getConfig(): GmConfig {
     statePersistenceEnabled: parseBoolean(process.env.STATE_PERSISTENCE_ENABLED, false),
     statePersistencePath: process.env.STATE_PERSISTENCE_PATH ?? './.runtime/gm-state.json',
     statePersistenceMaxAgeMinutes: parseInt10(process.env.STATE_PERSISTENCE_MAX_AGE_MINUTES, 360),
+
+    dryRun: parseBoolean(process.env.DRY_RUN, false),
 
     userMappings: parseUserMappings(process.env.USER_MAPPINGS ?? ''),
     targetGuildId: process.env.TARGET_GUILD_ID ?? '',

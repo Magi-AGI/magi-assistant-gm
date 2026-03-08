@@ -974,6 +974,9 @@ async function main(): Promise<void> {
   } catch { /* not in a git repo or git not available */ }
 
   logger.info(`Magi GM Assistant v6 starting... (${gitCommit})`);
+  if (config.dryRun) {
+    logger.info('  *** DRY-RUN MODE — delivery and wiki writes suppressed ***');
+  }
   logger.info(`  Model: ${config.anthropicModel}`);
   logger.info(`  Discord MCP: ${config.discordMcpUrl}`);
   logger.info(`  Foundry MCP: ${config.foundryMcpUrl}`);

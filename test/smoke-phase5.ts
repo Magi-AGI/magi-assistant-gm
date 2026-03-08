@@ -382,14 +382,20 @@ assert(events.some(e => e.type === 'gm_question'), 'R9: P1 question detected in 
 
 // Phase 6: Hesitation + simulated silence
 events.length = 0;
-detectorR.onTranscriptUpdate([
-  { text: 'uh the captain of the guard is', userId: 'gm', timestamp: new Date().toISOString() },
-]);
-// Simulate timer — force hesitation check
 const detAny = detectorR as any;
-detAny.lastHesitationTime = Date.now() - 6000;
+// Clear flowing-RP state — all prior segments were processed milliseconds apart,
+// making isFlowingRP() true which would suppress hesitation.
+detAny.recentSegments = [];
+detectorR.onTranscriptUpdate([
+  { text: 'his name is the captain of the guard', userId: 'gm', timestamp: new Date().toISOString() },
+]);
+// Simulate timer — force hesitation check (threshold is 15s, use 16s)
+detAny.lastHesitationTime = Date.now() - 16000;
 detAny.lastGmSpeechTime = detAny.lastHesitationTime;
 detAny.checkHesitation();
+// v6: Hesitation is P3 (batched). Force flush.
+detAny.lastFlushTime = 0;
+detAny.flush();
 assert(events.some(e => e.type === 'gm_hesitation'), 'R10: Hesitation detected after silence');
 
 detectorR.stop();

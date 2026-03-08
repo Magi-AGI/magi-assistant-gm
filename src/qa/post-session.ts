@@ -9,6 +9,7 @@
  * 5. Post QA summary to Discord (and Foundry if connected)
  */
 
+import { getConfig } from '../config.js';
 import { logger } from '../logger.js';
 import type { McpAggregator } from '../mcp/client.js';
 import type { FuzzyMatchTable } from '../reasoning/triggers.js';
@@ -179,6 +180,11 @@ async function persistFuzzyTable(
     } else {
       // No table exists — create one
       html += `\n<table>\n<tr><th>Garble</th><th>Correct</th></tr>\n${newRows}\n</table>`;
+    }
+
+    if (getConfig().dryRun) {
+      logger.info(`PostSessionQA: [DRY-RUN] would persist ${Object.keys(delta).length} new entries to wiki fuzzy table`);
+      return true;
     }
 
     await mcp.callTool('wiki__update_card', {
