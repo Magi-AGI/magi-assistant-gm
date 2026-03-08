@@ -39,6 +39,8 @@ export interface GmConfig {
   autoActiveMinTermLength: number;
   hesitationSilenceSeconds: number;
   hesitationKeywords: string[];
+  /** v6: Maximum GAP (hesitation) triggers per session. 0 = unlimited. */
+  maxGapTriggersPerSession: number;
 
   // Context / memory
   maxContextTokens: number;
@@ -74,8 +76,6 @@ export interface GmConfig {
 
 const DEFAULT_HESITATION_KEYWORDS = [
   "what's the",
-  'uh',
-  'um',
   'his name',
   'her name',
   'their name',
@@ -176,8 +176,9 @@ export function getConfig(): GmConfig {
     autoActiveWindowMinutes: parseInt10(process.env.AUTO_ACTIVE_WINDOW_MINUTES, 5),
     autoActiveThreshold: parseInt10(process.env.AUTO_ACTIVE_THRESHOLD, 3),
     autoActiveMinTermLength: parseInt10(process.env.AUTO_ACTIVE_MIN_TERM_LENGTH, 4),
-    hesitationSilenceSeconds: parseInt10(process.env.HESITATION_SILENCE_SECONDS, 5),
+    hesitationSilenceSeconds: parseInt10(process.env.HESITATION_SILENCE_SECONDS, 15),
     hesitationKeywords: parseStringArray(process.env.HESITATION_KEYWORDS, DEFAULT_HESITATION_KEYWORDS),
+    maxGapTriggersPerSession: parseInt10(process.env.MAX_GAP_TRIGGERS_PER_SESSION, 5),
 
     // Context / memory
     maxContextTokens: parseInt10(process.env.MAX_CONTEXT_TOKENS, 20_000),

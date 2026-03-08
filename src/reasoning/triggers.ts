@@ -16,6 +16,11 @@
  * - Phonetic matches use Double Metaphone + Jaro-Winkler similarity
  * - Auto-ACTIVE: phonetic matches count at 0.5 weight (6 needed vs 3 exact)
  * - NPC first-appearance: phonetic matching with higher threshold (≥0.8)
+ *
+ * v6 additions (Session 4 post-mortem):
+ * - Hesitation downgraded P1→P3 (now subject to 180s cooldown + flowing-RP suppression)
+ * - Per-session GAP cap (default 5) prevents hesitation flood
+ * - Hesitation silence threshold raised 5s→15s, 'um'/'uh' removed from keywords
  */
 
 import { readFileSync } from 'node:fs';
@@ -171,8 +176,11 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
   private lastHesitationText = '';
   /** Prevents re-firing until GM speaks again. */
   private hesitationFired = false;
+  /** v6: Count of GAP triggers fired this session (for per-session cap). */
+  private gapTriggerCount = 0;
   private readonly hesitationSilenceMs: number;
   private readonly hesitationPatterns: RegExp[];
+  private readonly maxGapTriggersPerSession: number;
 
   /** Recent transcript segments for flowing-RP detection. */
   private recentSegments: Array<{ userId: string; timestamp: number }> = [];
@@ -227,7 +235,9 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
     this.autoActiveThreshold = config.autoActiveThreshold;
 
     // v3: P1-H hesitation config (pre-compile patterns)
+    // v6: threshold raised from 5s→15s, downgraded from P1→P3, GAP cap added
     this.hesitationSilenceMs = config.hesitationSilenceSeconds * 1000;
+    this.maxGapTriggersPerSession = config.maxGapTriggersPerSession;
     this.hesitationPatterns = config.hesitationKeywords.map(kw => {
       const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       return new RegExp(`\\b${escaped}\\b`, 'i');
@@ -355,6 +365,7 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
     this.lastHesitationTime = 0;
     this.lastHesitationText = '';
     this.hesitationFired = false;
+    this.gapTriggerCount = 0;
     this.recentSegments = [];
     this.sceneMatchState.clear();
   }
@@ -782,8 +793,14 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
   }
 
   /**
-   * P1-H: If GM's last speech contained a hesitation keyword and they've been
-   * silent for ≥hesitationSilenceMs, fire a gap-fill trigger.
+   * Hesitation gap-fill trigger.
+   *
+   * v6 changes (Session 4 post-mortem):
+   * - Downgraded from P1 → P3 (now subject to 180s cooldown)
+   * - Added flowing-RP suppression (same as P3/P4)
+   * - Added per-session GAP cap (default 5)
+   * - Silence threshold raised from 5s → 15s (in config)
+   * - Removed 'um'/'uh' from default keywords (in config)
    */
   private checkHesitation(): void {
     if (this.pacing.assistantState !== AssistantState.ACTIVE) return;
@@ -797,10 +814,24 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
     const silenceMs = now - this.lastHesitationTime;
     if (silenceMs >= this.hesitationSilenceMs) {
       this.hesitationFired = true;
-      logger.info(`TriggerDetector: P1-H hesitation (${Math.round(silenceMs / 1000)}s silence after "${this.lastHesitationText.slice(0, 80)}")`);
+
+      // v6: Per-session GAP cap
+      if (this.maxGapTriggersPerSession > 0 && this.gapTriggerCount >= this.maxGapTriggersPerSession) {
+        logger.debug(`TriggerDetector: hesitation suppressed (GAP cap ${this.maxGapTriggersPerSession} reached)`);
+        return;
+      }
+
+      // v6: Suppress during flowing RP (same as P3/P4)
+      if (this.isFlowingRP()) {
+        logger.debug('TriggerDetector: hesitation suppressed (flowing RP)');
+        return;
+      }
+
+      this.gapTriggerCount++;
+      logger.info(`TriggerDetector: P3 hesitation [${this.gapTriggerCount}/${this.maxGapTriggersPerSession || '∞'}] (${Math.round(silenceMs / 1000)}s silence after "${this.lastHesitationText.slice(0, 80)}")`);
       this.addEvent({
         type: 'gm_hesitation',
-        priority: TriggerPriority.P1,
+        priority: TriggerPriority.P3,
         source: 'hesitation',
         data: {
           transcript: this.lastHesitationText,

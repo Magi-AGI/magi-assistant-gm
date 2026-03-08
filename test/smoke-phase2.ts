@@ -288,9 +288,9 @@ detector7.on('trigger', (batch) => {
 });
 detector7.start();
 
-// 7a: GM says "uh" — should not fire immediately
+// 7a: GM says hesitation keyword — should not fire immediately
 detector7.onTranscriptUpdate([
-  { text: 'so the uh thing is over there', userId: 'gm', timestamp: new Date().toISOString() },
+  { text: 'remind me what the captain said', userId: 'gm', timestamp: new Date().toISOString() },
 ]);
 assert(hesitationEvents.length === 0, '7a: No hesitation event fired immediately');
 
@@ -306,10 +306,13 @@ const det7any = detector7 as any;
 detector7.onTranscriptUpdate([
   { text: 'his name is uh the captain', userId: 'gm', timestamp: new Date().toISOString() },
 ]);
-// Force the hesitation time back so it looks like 6s of silence has passed
-det7any.lastHesitationTime = Date.now() - 6000;
+// Force the hesitation time back so it looks like 16s of silence has passed (threshold is 15s)
+det7any.lastHesitationTime = Date.now() - 16000;
 det7any.lastGmSpeechTime = det7any.lastHesitationTime; // Last speech WAS the hesitation
 det7any.checkHesitation();
+// v6: Hesitation is now P3 (batched, not immediate). Reset cooldown timer and force flush.
+det7any.lastFlushTime = 0;
+det7any.flush();
 assert(hesitationEvents.length === 1, '7c: Hesitation fires after silence threshold');
 assert(hesitationEvents[0].data.transcript === 'his name is uh the captain', '7c: Correct transcript in event');
 
@@ -321,7 +324,7 @@ assert(hesitationEvents.length === 1, '7d: Does not re-fire until GM speaks agai
 hesitationEvents.length = 0;
 det7any.hesitationFired = false;
 detector7.onTranscriptUpdate([
-  { text: 'uh what was that', userId: 'gm', timestamp: new Date().toISOString() },
+  { text: 'remind me what was that', userId: 'gm', timestamp: new Date().toISOString() },
   { text: 'oh right the reactor', userId: 'gm', timestamp: new Date().toISOString() },
 ]);
 // The non-hesitation segment should have cleared lastHesitationTime
