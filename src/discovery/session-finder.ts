@@ -208,7 +208,9 @@ export async function findBeatCards(
   planCardName: string | null,
   campaignName: string,
 ): Promise<BeatCardSearchResult> {
-  if (!sessionNumber || sessionNumber <= 0) {
+  // Strategy 1 works even without a session number (children of known plan card)
+  // Strategy 2 requires a session number for name-based search
+  if ((!sessionNumber || sessionNumber <= 0) && !planCardName) {
     return { cards: [], sessionNumber: 0, discoveryMethod: 'none' };
   }
 
@@ -246,7 +248,11 @@ export async function findBeatCards(
     }
   }
 
-  // Strategy 2: Name-based search
+  // Strategy 2: Name-based search (requires valid session number)
+  if (!sessionNumber || sessionNumber <= 0) {
+    logger.info('SessionFinder: no beat cards found (no session number for name search)');
+    return { cards: [], sessionNumber: sessionNumber || 0, discoveryMethod: 'none' };
+  }
   try {
     const query = `Session_${sessionNumber}_Scene`;
     const searchRaw = await mcp.callTool('wiki__search_cards', {
