@@ -10,7 +10,7 @@ import { logger } from '../logger.js';
 import type { McpAggregator } from '../mcp/client.js';
 import type { GmConfig } from '../config.js';
 import { extractMcpText } from '../reasoning/context.js';
-import { findSessionPlan, slugify, extractGroupId, type SessionFinderResult } from './session-finder.js';
+import { findSessionPlan, findBeatCards, slugify, extractGroupId, type SessionFinderResult } from './session-finder.js';
 import { buildFuzzyTable, type FuzzyBuildResult } from './fuzzy-builder.js';
 import type { FuzzyMatchTable } from '../reasoning/triggers.js';
 
@@ -81,6 +81,10 @@ export interface DiscoveryReport {
   fuzzyTable: FuzzyMatchTable;
   /** Activation dictionary term count (estimate). */
   activationDictSize: number;
+  /** v7: Beat card paths discovered for this session. */
+  beatCardPaths: string[];
+  /** v7: Number of beat cards found. */
+  beatCardCount: number;
   /** Warnings accumulated during discovery. */
   warnings: string[];
 }
@@ -200,7 +204,17 @@ export async function runWikiDiscovery(
     warnings.push('Fuzzy match table is empty. Auto-ACTIVE detection may not trigger reliably.');
   }
 
-  // -- Step 4: Estimate activation dictionary size --
+  // -- Step 4: v7 — Find beat cards for this session --
+  const sessionNumber = sessionPlan?.sessionNumber ?? 0;
+  const beatCardResult = await findBeatCards(mcp, sessionNumber, planCardName, config.campaignName);
+  const beatCardPaths = beatCardResult.cards;
+  if (beatCardPaths.length > 0) {
+    logger.info(`WikiDiscovery: found ${beatCardPaths.length} beat cards for session ${sessionNumber} (via ${beatCardResult.discoveryMethod})`);
+  } else if (sessionNumber > 0) {
+    warnings.push(`No beat cards found for session ${sessionNumber}. Beat reminders and whisper staging will be unavailable.`);
+  }
+
+  // -- Step 5: Estimate activation dictionary size --
   const activationTerms = new Set<string>();
   for (const [garbled, canonical] of Object.entries(fuzzyResult.table)) {
     activationTerms.add(garbled);
@@ -218,6 +232,7 @@ export async function runWikiDiscovery(
 
   logger.info(
     `WikiDiscovery: complete -- plan: ${planCardName ?? 'NONE'}, ` +
+    `beat cards: ${beatCardPaths.length}, ` +
     `fuzzy: ${fuzzyResult.total} terms, activation: ~${activationDictSize} terms, ` +
     `warnings: ${warnings.length}`
   );
@@ -231,6 +246,8 @@ export async function runWikiDiscovery(
     fuzzyResult,
     fuzzyTable: fuzzyResult.table,
     activationDictSize,
+    beatCardPaths,
+    beatCardCount: beatCardPaths.length,
     warnings,
   };
 }
@@ -260,6 +277,13 @@ export function formatReadinessReport(report: DiscoveryReport, config: GmConfig)
 
   // NPC links
   lines.push(`NPC/Content Links: ${report.npcLinks.length} found`);
+
+  // v7: Beat cards
+  if (report.beatCardCount > 0) {
+    lines.push(`Beat Cards: ${report.beatCardCount} found`);
+  } else {
+    lines.push('Beat Cards: NONE — beat reminders unavailable');
+  }
 
   // Fuzzy table
   const f = report.fuzzyResult;

@@ -60,6 +60,13 @@ function extractSessionNumber(card: SearchResult): number {
   return 0;
 }
 
+export interface BeatCardSearchResult {
+  /** Wiki card paths for discovered beat/scene cards. */
+  cards: string[];
+  sessionNumber: number;
+  discoveryMethod: 'plan-children' | 'name-search' | 'none';
+}
+
 export interface SessionFinderResult {
   /** The wiki card name (path) of the session plan. */
   cardName: string;
@@ -185,4 +192,112 @@ export async function findSessionPlan(
   }
 
   return discovered;
+}
+
+/**
+ * v7: Find scene beat cards for a session, even without a BG_SessionPlan.
+ *
+ * Strategy 1: If planCardName exists, list_children and filter for scene/beat cards.
+ * Strategy 2: search_cards with "Session_{N}_Scene" name pattern.
+ *
+ * Returns card paths sorted by title (preserving scene order).
+ */
+export async function findBeatCards(
+  mcp: McpAggregator,
+  sessionNumber: number,
+  planCardName: string | null,
+  campaignName: string,
+): Promise<BeatCardSearchResult> {
+  if (!sessionNumber || sessionNumber <= 0) {
+    return { cards: [], sessionNumber: 0, discoveryMethod: 'none' };
+  }
+
+  const beatCardPattern = /(?:scene|beat|gm.?notes)/i;
+
+  // Strategy 1: Children of the plan card
+  if (planCardName) {
+    try {
+      const childrenRaw = await mcp.callTool('wiki__list_children', {
+        parent_name: planCardName,
+        depth: 2,
+        limit: 50,
+      });
+      const childrenText = extractMcpText(childrenRaw);
+      if (childrenText) {
+        const parsed = JSON.parse(childrenText);
+        const children: SearchResult[] = (Array.isArray(parsed) ? parsed : (parsed?.results ?? []))
+          .map((r: Record<string, unknown>) => ({
+            id: String(r.id ?? ''),
+            title: String(r.title ?? r.id ?? ''),
+          }));
+
+        const beatCards = children
+          .filter(c => beatCardPattern.test(c.title) || beatCardPattern.test(c.id))
+          .map(c => c.id)
+          .sort();
+
+        if (beatCards.length > 0) {
+          logger.info(`SessionFinder: found ${beatCards.length} beat cards via plan children`);
+          return { cards: beatCards, sessionNumber, discoveryMethod: 'plan-children' };
+        }
+      }
+    } catch (err) {
+      logger.debug('SessionFinder: plan children search for beat cards failed:', err);
+    }
+  }
+
+  // Strategy 2: Name-based search
+  try {
+    const query = `Session_${sessionNumber}_Scene`;
+    const searchRaw = await mcp.callTool('wiki__search_cards', {
+      query,
+      search_in: 'name',
+      limit: 30,
+    });
+    const results = parseSearchResults(searchRaw);
+
+    // Filter by campaign name in path
+    const campaignSlug = slugify(campaignName);
+    const beatCards = results
+      .filter(r => {
+        const idSlug = slugify(r.id);
+        return idSlug.includes(campaignSlug);
+      })
+      .map(r => r.id)
+      .sort();
+
+    if (beatCards.length > 0) {
+      logger.info(`SessionFinder: found ${beatCards.length} beat cards via name search ("${query}")`);
+      return { cards: beatCards, sessionNumber, discoveryMethod: 'name-search' };
+    }
+  } catch (err) {
+    logger.debug('SessionFinder: name search for beat cards failed:', err);
+  }
+
+  // Also try with space instead of underscore
+  try {
+    const query = `Session ${sessionNumber} Scene`;
+    const searchRaw = await mcp.callTool('wiki__search_cards', {
+      query,
+      search_in: 'name',
+      limit: 30,
+    });
+    const results = parseSearchResults(searchRaw);
+
+    const campaignSlug = slugify(campaignName);
+    const beatCards = results
+      .filter(r => slugify(r.id).includes(campaignSlug))
+      .map(r => r.id)
+      .sort();
+
+    if (beatCards.length > 0) {
+      logger.info(`SessionFinder: found ${beatCards.length} beat cards via name search (space variant)`);
+      return { cards: beatCards, sessionNumber, discoveryMethod: 'name-search' };
+    }
+  } catch (err) {
+    logger.debug('SessionFinder: space variant name search failed:', err);
+  }
+
+  logger.info('SessionFinder: no beat cards found');
+  return { cards: [], sessionNumber, discoveryMethod: 'none' };
 }

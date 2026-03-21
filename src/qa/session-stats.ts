@@ -24,6 +24,12 @@ export interface SessionStats {
   totalSegmentCount: number;
   /** Speaker distribution accumulated in real-time (name → segment count). */
   speakerDistribution: Record<string, number>;
+  /** v7: Beat reminders delivered. */
+  beatRemindersDelivered: number;
+  /** v7: Whisper-ready notifications delivered. */
+  whisperNotificationsDelivered: number;
+  /** v7: Whispers actually sent (via /send). */
+  whispersSent: number;
 }
 
 /** Create a fresh stats object for a new session. */
@@ -38,5 +44,8 @@ export function createSessionStats(): SessionStats {
     activationSource: null,
     totalSegmentCount: 0,
     speakerDistribution: {},
+    beatRemindersDelivered: 0,
+    whisperNotificationsDelivered: 0,
+    whispersSent: 0,
   };
 }

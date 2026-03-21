@@ -10,6 +10,8 @@ import type { AdviceEnvelope, AdviceCategory } from '../types/index.js';
 /** Category → HTML color for the tag prefix. */
 const CATEGORY_COLORS: Record<AdviceCategory, string> = {
   script: '#4a9eff',       // blue
+  beat: '#ff5722',         // deep orange — v7 beat reminders
+  whisper: '#673ab7',      // deep purple — v7 whisper staging
   'gap-fill': '#00bcd4',   // cyan — fast, urgent, distinct from script blue
   pacing: '#ff9800',       // orange
   continuity: '#9c27b0',   // purple

@@ -30,13 +30,15 @@ import { extractMcpText } from './reasoning/context.js';
 import { runWikiDiscovery, formatReadinessReport, type DiscoveryReport } from './discovery/wiki-bootstrap.js';
 import { NpcCacheBuilder } from './reasoning/npc-cache.js';
 import { SceneIndexBuilder } from './reasoning/scene-index.js';
+import { BeatCacheBuilder } from './reasoning/beat-cache.js';
+import { WhisperStager } from './reasoning/whisper-stage.js';
 import { AdviceDelivery } from './output/index.js';
 import { ImageQueue } from './output/image-queue.js';
 import { parseGmCommand } from './state/gm-commands.js';
 import { createSessionStats, type SessionStats } from './qa/session-stats.js';
 import { runPostSessionQa, formatQaReport } from './qa/post-session.js';
-import { AssistantState } from './types/index.js';
-import type { ActivationSource, NpcCacheEntry, SceneIndexEntry } from './types/index.js';
+import { AssistantState, TriggerPriority } from './types/index.js';
+import type { ActivationSource, NpcCacheEntry, SceneIndexEntry, BeatReminderEntry, WhisperStageEntry } from './types/index.js';
 import type { FuzzyMatchTable } from './reasoning/triggers.js';
 
 const config = getConfig();
@@ -55,10 +57,13 @@ let delivery: AdviceDelivery | null = null;
 // v3: Cache state
 let npcCache: NpcCacheEntry[] = [];
 let sceneIndex: SceneIndexEntry[] = [];
+let beatCache: BeatReminderEntry[] = [];
+let whisperStage: WhisperStageEntry[] = [];
 let activationBuildInProgress = false;
 
 // v4: Wiki discovery state
 let discoveredPlanCard: string | null = null;
+let discoveredBeatCards: string[] = [];
 let lastDiscoveryReport: DiscoveryReport | null = null;
 let currentFuzzyTable: FuzzyMatchTable = {};
 
@@ -377,19 +382,21 @@ async function handleActivation(source: ActivationSource): Promise<void> {
 }
 
 /**
- * Build NPC pre-cache and scene index from the episode plan.
+ * Build NPC pre-cache, scene index, beat cache, and whisper stage from the episode plan.
  * Called asynchronously on ACTIVE transition.
  */
 async function buildActivationCaches(episodePlanCard: string): Promise<void> {
-  logger.info('Orchestrator: building NPC cache and scene index...');
+  logger.info('Orchestrator: building NPC cache, scene index, beat cache, whisper stage...');
 
   pacing.setNpcCacheStatus('building');
   pacing.setSceneIndexStatus('building');
 
-  // Build both in parallel
-  const [npcResult, sceneResult] = await Promise.allSettled([
+  // Build all in parallel
+  const [npcResult, sceneResult, beatResult, whisperResult] = await Promise.allSettled([
     new NpcCacheBuilder(mcp, config.npcCacheMaxBriefWords).build(episodePlanCard),
     new SceneIndexBuilder(mcp, config.autoActiveMinTermLength).build(episodePlanCard),
+    new BeatCacheBuilder(mcp).build(discoveredBeatCards),
+    new WhisperStager(mcp).build(discoveredBeatCards),
   ]);
 
   // Apply NPC cache
@@ -425,6 +432,25 @@ async function buildActivationCaches(episodePlanCard: string): Promise<void> {
   } else {
     pacing.setSceneIndexStatus('error');
     logger.error('Orchestrator: scene index build failed:', sceneResult.reason);
+  }
+
+  // v7: Apply beat cache
+  if (beatResult.status === 'fulfilled') {
+    beatCache = beatResult.value;
+    if (triggers) triggers.setBeatCache(beatCache);
+    const withNotes = beatCache.filter(b => b.bullets.length > 0).length;
+    logger.info(`Orchestrator: beat cache ready (${beatCache.length} entries, ${withNotes} with GM Notes)`);
+  } else {
+    logger.error('Orchestrator: beat cache build failed:', beatResult.reason);
+  }
+
+  // v7: Apply whisper stage
+  if (whisperResult.status === 'fulfilled') {
+    whisperStage = whisperResult.value;
+    if (triggers) triggers.setWhisperStage(whisperStage);
+    logger.info(`Orchestrator: whisper stage ready (${whisperStage.length} entries)`);
+  } else {
+    logger.error('Orchestrator: whisper stage build failed:', whisperResult.reason);
   }
 }
 
@@ -882,6 +908,7 @@ function applyGmCommand(cmd: import('./types/index.js').GmCommand): void {
       runWikiDiscovery(mcp, config).then(async (discovery) => {
         lastDiscoveryReport = discovery;
         discoveredPlanCard = discovery.planCardName;
+        discoveredBeatCards = discovery.beatCardPaths;
         currentFuzzyTable = discovery.fuzzyTable;
 
         // Hot-reload fuzzy table into trigger detector
@@ -959,6 +986,89 @@ function applyGmCommand(cmd: import('./types/index.js').GmCommand): void {
         delivery.postSystemMessage(`Note received (${gmNotes.length}/${MAX_GM_NOTES}): ${noteText.slice(0, 80)}${noteText.length > 80 ? '...' : ''}`).catch(() => {});
       }
       break;
+    }
+
+    // v7: Whisper delivery confirmation
+    case 'send': {
+      const targetArg = cmd.args[0]?.toLowerCase().trim();
+      if (!targetArg) {
+        // Send most recent un-sent whisper
+        const pending = whisperStage.find(w => w.notified && !w.sent);
+        if (pending) {
+          sendWhisper(pending);
+        } else {
+          logger.warn('GM command: /send — no pending whispers');
+          if (delivery) delivery.postSystemMessage('No pending whispers to send.').catch(() => {});
+        }
+        break;
+      }
+      // Find by target name
+      const match = whisperStage.find(w => !w.sent && w.target.toLowerCase().includes(targetArg));
+      if (match) {
+        sendWhisper(match);
+      } else {
+        logger.warn(`GM command: /send — no whisper found for "${targetArg}"`);
+        if (delivery) delivery.postSystemMessage(`No whisper found for "${targetArg}".`).catch(() => {});
+      }
+      break;
+    }
+
+    // v7: Beat reminder management
+    case 'beats': {
+      const subCmd = cmd.args[0]?.toLowerCase();
+      if (subCmd === 'serve' && cmd.args[1]) {
+        const beatId = cmd.args[1].toLowerCase();
+        const beat = beatCache.find(b => b.sceneId.includes(beatId) || b.sceneTitle.toLowerCase().includes(beatId));
+        if (beat && delivery) {
+          beat.served = true;
+          beat.servedAt = new Date().toISOString();
+          const beatEnvelope: import('./types/index.js').AdviceEnvelope = {
+            category: 'beat',
+            tag: 'BEAT_REMINDER',
+            priority: TriggerPriority.P2,
+            summary: `Beat: ${beat.sceneTitle}`,
+            body: beat.bullets.map(b => `- ${b}`).join('\n'),
+            confidence: 1.0,
+            source_cards: [beat.sourceCard],
+          };
+          delivery.deliver(beatEnvelope).then(() => {
+            sessionStats.beatRemindersDelivered++;
+          }).catch(err => logger.error('Failed to deliver beat reminder:', err));
+        } else {
+          logger.warn(`GM command: /beats serve — beat not found for "${cmd.args[1]}"`);
+        }
+      } else {
+        // List all beats
+        const lines = beatCache.map(b =>
+          `${b.served ? '✓' : '○'} ${b.sceneTitle} (${b.bullets.length} notes)`
+        );
+        const msg = lines.length > 0
+          ? `Beat reminders (${beatCache.length}):\n${lines.join('\n')}`
+          : 'No beat reminders cached.';
+        if (delivery) delivery.postSystemMessage(msg).catch(() => {});
+      }
+      break;
+    }
+  }
+}
+
+/** v7: Send a pre-staged whisper via Foundry. */
+async function sendWhisper(entry: WhisperStageEntry): Promise<void> {
+  try {
+    await mcp.callTool('foundry__send_whisper', {
+      target: entry.target,
+      content: entry.text,
+    });
+    entry.sent = true;
+    sessionStats.whispersSent++;
+    logger.info(`Orchestrator: whisper sent to ${entry.target} (${entry.id})`);
+    if (delivery) {
+      delivery.postSystemMessage(`Whisper sent to ${entry.target}.`).catch(() => {});
+    }
+  } catch (err) {
+    logger.error(`Orchestrator: failed to send whisper to ${entry.target}:`, err);
+    if (delivery) {
+      delivery.postSystemMessage(`Failed to send whisper to ${entry.target}.`).catch(() => {});
     }
   }
 }
@@ -1046,6 +1156,7 @@ async function main(): Promise<void> {
     const discovery = await runWikiDiscovery(mcp, config);
     lastDiscoveryReport = discovery;
     discoveredPlanCard = discovery.planCardName;
+    discoveredBeatCards = discovery.beatCardPaths;
     fuzzyTable = discovery.fuzzyTable;
     currentFuzzyTable = discovery.fuzzyTable;
 
@@ -1131,14 +1242,71 @@ async function main(): Promise<void> {
   triggers.on('trigger', async (batch) => {
     if (!engine || !delivery) return;
 
-    const envelope = await engine.process(batch);
-    if (envelope) {
-      if (envelope.image) {
-        imageQueue.setPending(envelope.image);
+    // v7: Beat reminders and whisper notifications bypass LLM — pre-composed content
+    const beatEvents = batch.events.filter(e => e.type === 'beat_reminder');
+    const whisperEvents = batch.events.filter(e => e.type === 'whisper_ready');
+    const otherEvents = batch.events.filter(e => e.type !== 'beat_reminder' && e.type !== 'whisper_ready');
+
+    for (const evt of beatEvents) {
+      const bullets = evt.data.bullets as string[];
+      const title = evt.data.scene_title as string;
+      const sourceCard = evt.data.source_card as string;
+      const envelope: import('./types/index.js').AdviceEnvelope = {
+        category: 'beat',
+        tag: 'BEAT_REMINDER',
+        priority: TriggerPriority.P2,
+        summary: `Beat: ${title}`,
+        body: bullets.map(b => `- ${b}`).join('\n'),
+        confidence: 1.0,
+        source_cards: [sourceCard],
+      };
+      if (!memory.isDuplicate(envelope)) {
+        memory.push(envelope);
+        const channel = await delivery.deliver(envelope);
+        trackDelivery(channel);
+        sessionStats.beatRemindersDelivered++;
       }
-      const channel = await delivery.deliver(envelope);
-      trackDelivery(channel);
-    } else {
+    }
+
+    for (const evt of whisperEvents) {
+      const target = evt.data.target as string;
+      const description = evt.data.description as string;
+      const sourceCard = evt.data.source_card as string;
+      const envelope: import('./types/index.js').AdviceEnvelope = {
+        category: 'whisper',
+        tag: 'WHISPER_READY',
+        priority: TriggerPriority.P2,
+        summary: `Whisper ready: ${description} → ${target}`,
+        body: `Private content staged for ${target}. Type /send ${target} to deliver.\nSource: ${sourceCard}`,
+        confidence: 1.0,
+        source_cards: [sourceCard],
+      };
+      if (!memory.isDuplicate(envelope)) {
+        memory.push(envelope);
+        const channel = await delivery.deliver(envelope);
+        trackDelivery(channel);
+        sessionStats.whisperNotificationsDelivered++;
+      }
+    }
+
+    // Process remaining events through LLM as normal
+    if (otherEvents.length > 0) {
+      const remainingBatch: import('./types/index.js').TriggerBatch = {
+        events: otherEvents,
+        flushedAt: batch.flushedAt,
+      };
+      const envelope = await engine.process(remainingBatch);
+      if (envelope) {
+        if (envelope.image) {
+          imageQueue.setPending(envelope.image);
+        }
+        const channel = await delivery.deliver(envelope);
+        trackDelivery(channel);
+      } else {
+        sessionStats.adviceSuppressed++;
+      }
+    } else if (beatEvents.length === 0 && whisperEvents.length === 0) {
+      // Empty batch after filtering — should not happen, but handle gracefully
       sessionStats.adviceSuppressed++;
     }
   });

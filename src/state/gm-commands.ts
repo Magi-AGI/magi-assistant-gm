@@ -17,10 +17,11 @@ const VALID_COMMANDS: ReadonlySet<string> = new Set<GmCommandType>([
   'separation', 'climax', 'seed', 'sleep', 'wake',
   'endtime', 'npc', 'status', 'rediscover',
   'plan', 'note',
+  'send', 'beats', // v7: whisper delivery + beat reminder management
 ]);
 
 /** Commands where the full remaining text is a single argument (not split by whitespace). */
-const FULL_TEXT_COMMANDS: ReadonlySet<string> = new Set(['plan', 'note']);
+const FULL_TEXT_COMMANDS: ReadonlySet<string> = new Set(['plan', 'note', 'send']);
 
 /**
  * Parse a chat message for a GM command or @magi mention.

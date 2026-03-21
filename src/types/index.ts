@@ -33,6 +33,8 @@ export type TriggerType =
   | 'pacing_gate_denouement' // P2 (v3)
   | 'pacing_alert' // P3 scene overrun
   | 'epic_success' // P3 (v3)
+  | 'beat_reminder' // P2 (v7): beat card GM Notes matched to scene
+  | 'whisper_ready' // P2 (v7): pre-staged whisper content available
   | 'silence_detection'; // P4
 
 export interface TriggerEvent {
@@ -52,6 +54,8 @@ export interface TriggerBatch {
 
 export type AdviceCategory =
   | 'script'
+  | 'beat'      // v7: scene beat reminder (pre-composed GM notes)
+  | 'whisper'   // v7: whisper pre-stage notification
   | 'gap-fill'
   | 'pacing'
   | 'continuity'
@@ -131,6 +135,40 @@ export interface SceneIndexEntry {
   npcs: string[];
   served: boolean;
   served_at: string | null;
+}
+
+// v7: Beat Reminder Cache
+
+export interface BeatReminderEntry {
+  /** Scene identifier — shared namespace with SceneIndexEntry.id. */
+  sceneId: string;
+  sceneTitle: string;
+  /** Wiki card path the beat came from. */
+  sourceCard: string;
+  /** Compressed GM Notes (max 3 bullets). */
+  bullets: string[];
+  /** Keywords for scene matching. */
+  keywords: string[];
+  served: boolean;
+  servedAt: string | null;
+}
+
+// v7: Whisper Pre-Stage Queue
+
+export interface WhisperStageEntry {
+  /** Slugified identifier. */
+  id: string;
+  /** Target player or character name. */
+  target: string;
+  /** Short summary for notification. */
+  description: string;
+  /** Full whisper content. */
+  text: string;
+  /** Keywords for scene matching. */
+  sceneKeywords: string[];
+  sourceCard: string;
+  notified: boolean;
+  sent: boolean;
 }
 
 export interface PacingState {
@@ -217,7 +255,9 @@ export type GmCommandType =
   | 'status'     // v4: re-post readiness report
   | 'rediscover' // v4: re-run wiki discovery
   | 'plan'       // v4: override session plan card
-  | 'note';      // v4: inject GM note into reasoning context
+  | 'note'       // v4: inject GM note into reasoning context
+  | 'send'       // v7: confirm whisper pre-stage delivery
+  | 'beats';     // v7: list/serve beat reminders
 
 export interface GmCommand {
   type: GmCommandType;

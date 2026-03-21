@@ -29,7 +29,7 @@ import { logger } from '../logger.js';
 import { getConfig } from '../config.js';
 import { PhoneticMatcher } from '../matching/phonetic.js';
 import type { PacingStateManager } from '../state/pacing.js';
-import type { NpcCacheEntry, SceneIndexEntry, ActivationSource } from '../types/index.js';
+import type { NpcCacheEntry, SceneIndexEntry, BeatReminderEntry, WhisperStageEntry, ActivationSource } from '../types/index.js';
 import {
   AssistantState,
   TriggerPriority,
@@ -210,6 +210,13 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
   /** Track accumulated keyword matches per scene within a rolling window. */
   private sceneMatchState = new Map<string, { keywords: Set<string>; windowStart: number }>();
 
+  // ── v7: Beat reminder cache + whisper pre-stage (set by orchestrator) ──
+
+  private beatCache: BeatReminderEntry[] = [];
+  private whisperStage: WhisperStageEntry[] = [];
+  /** Track last Foundry scene change time for transition suppression. */
+  private lastFoundrySceneChangeTime = 0;
+
   // ── v4: Phonetic match collection (for post-session QA) ────────────────
 
   /** Phonetic matches discovered during this session (garble → canonical). */
@@ -315,6 +322,18 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
   setSceneIndex(index: SceneIndexEntry[]): void {
     this.sceneIndex = index;
     logger.info(`TriggerDetector: scene index loaded (${index.length} entries)`);
+  }
+
+  // v7: Beat cache + whisper stage setters
+
+  setBeatCache(cache: BeatReminderEntry[]): void {
+    this.beatCache = cache;
+    logger.info(`TriggerDetector: beat cache loaded (${cache.length} entries)`);
+  }
+
+  setWhisperStage(stage: WhisperStageEntry[]): void {
+    this.whisperStage = stage;
+    logger.info(`TriggerDetector: whisper stage loaded (${stage.length} entries)`);
   }
 
   getFuzzyTable(): FuzzyMatchTable {
@@ -458,16 +477,21 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
         });
       }
 
-      // P2: Scene transition keywords (ACTIVE only)
+      // P3: Scene transition keywords (ACTIVE only, v7: downgraded from P2, suppressed near Foundry scene change)
       if (this.pacing.assistantState === AssistantState.ACTIVE && this.isSceneTransitionKeyword(seg.text)) {
-        logger.info(`TriggerDetector: P2 scene transition keyword — "${seg.text.trim().slice(0, 80)}"`);
-        this.addEvent({
-          type: 'scene_transition',
-          priority: TriggerPriority.P2,
-          source: 'transcript',
-          data: { transcript: seg.text },
-          timestamp: seg.timestamp,
-        });
+        const recentFoundryChange = Math.abs(Date.now() - this.lastFoundrySceneChangeTime) < 30_000;
+        if (recentFoundryChange) {
+          logger.debug('TriggerDetector: suppressing transcript scene transition (Foundry scene change within 30s)');
+        } else {
+          logger.info(`TriggerDetector: P3 scene transition keyword — "${seg.text.trim().slice(0, 80)}"`);
+          this.addEvent({
+            type: 'scene_transition',
+            priority: TriggerPriority.P3,
+            source: 'transcript',
+            data: { transcript: seg.text },
+            timestamp: seg.timestamp,
+          });
+        }
       }
 
       // P2: Act transition keywords (ACTIVE only)
@@ -509,6 +533,9 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
 
     // Scene change from Foundry → P2
     if (eventType === 'sceneChange') {
+      // v7: Record Foundry scene change time for transcript transition suppression
+      this.lastFoundrySceneChangeTime = Date.now();
+
       // v3: PREGAME → ACTIVE via Foundry scene change — notify orchestrator.
       // The orchestrator's handleActivation() runs synchronously (no awaits),
       // so state is ACTIVE by the time emit() returns, and the P2 event
@@ -701,6 +728,61 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
             scene_title: scene.title,
             scene_card: scene.card,
             matched_keywords: allMatched,
+          },
+          timestamp,
+        });
+
+        // v7: Check beat reminder cache for matching scene
+        this.checkBeatAndWhisperForKeywords(allMatched, timestamp);
+      }
+    }
+  }
+
+  /**
+   * v7: Check beat reminder cache and whisper stage for keyword matches.
+   * Called when a scene keyword match fires. Emits beat_reminder and/or
+   * whisper_ready events for any unserved entries with overlapping keywords.
+   */
+  private checkBeatAndWhisperForKeywords(matchedKeywords: string[], timestamp: string): void {
+    // Beat reminders
+    for (const beat of this.beatCache) {
+      if (beat.served) continue;
+      const overlap = beat.keywords.some(kw => matchedKeywords.includes(kw));
+      if (overlap) {
+        beat.served = true;
+        beat.servedAt = new Date().toISOString();
+        logger.info(`TriggerDetector: P2 beat reminder — "${beat.sceneTitle}"`);
+        this.addEvent({
+          type: 'beat_reminder',
+          priority: TriggerPriority.P2,
+          source: 'beat-cache',
+          data: {
+            scene_id: beat.sceneId,
+            scene_title: beat.sceneTitle,
+            source_card: beat.sourceCard,
+            bullets: beat.bullets,
+          },
+          timestamp,
+        });
+      }
+    }
+
+    // Whisper pre-stage
+    for (const whisper of this.whisperStage) {
+      if (whisper.notified) continue;
+      const overlap = whisper.sceneKeywords.some(kw => matchedKeywords.includes(kw));
+      if (overlap) {
+        whisper.notified = true;
+        logger.info(`TriggerDetector: P2 whisper ready — "${whisper.description}" → ${whisper.target}`);
+        this.addEvent({
+          type: 'whisper_ready',
+          priority: TriggerPriority.P2,
+          source: 'whisper-stage',
+          data: {
+            whisper_id: whisper.id,
+            target: whisper.target,
+            description: whisper.description,
+            source_card: whisper.sourceCard,
           },
           timestamp,
         });
