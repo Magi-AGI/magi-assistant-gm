@@ -27,7 +27,7 @@ import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'events';
 import { logger } from '../logger.js';
 import { getConfig } from '../config.js';
-import { PhoneticMatcher } from '../matching/phonetic.js';
+import { PhoneticMatcher, type PhoneticMatch } from '../matching/phonetic.js';
 import type { PacingStateManager } from '../state/pacing.js';
 import type { NpcCacheEntry, SceneIndexEntry, BeatReminderEntry, WhisperStageEntry, ActivationSource } from '../types/index.js';
 import {
@@ -73,6 +73,18 @@ const ACT_TRANSITION_KEYWORDS = [
 
 const MAX_PENDING_EVENTS = 100;
 const MAX_PHONETIC_DISCOVERIES = 500;
+
+// QA #32/#33: Discovery-recording is stricter than activation/NPC matching.
+// Activation tolerates 0.6 jaro-winkler so weak garbles still nudge the rolling
+// window at 0.5 weight; recording a "discovery" persists to the QA report and
+// (≥0.8) into the wiki fuzzy table, so the floor is higher.
+const DISCOVERY_MIN_METAPHONE_SIM = 0.7;
+const DISCOVERY_MIN_JW_ONLY_SIM = 0.85;
+
+// Patterns that mark the surrounding text as a literal name spelling, Fate roll
+// readout, or numeric aside — not a phonetic garble. BG S9 contamination cases.
+const SPELLING_CUE_PATTERN = /\b(?:spelled?|spelling|that['']?s\s+(?:[a-z]\s+){2,}|[a-z](?:[\s-][a-z]){3,})\b/i;
+const FATE_READOUT_PATTERN = /(?:\b(?:plus|minus)\s+\d+\b|\bladder\b|[+−-]\s?\d\b|\brolled?\s+\w+\s+(?:plus|minus|\+|-)\s?\d)/i;
 
 const FLOWING_RP_MIN_SPEAKERS = 2;
 const FLOWING_RP_MIN_SEGMENTS = 4;
@@ -372,6 +384,26 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
     return [...this._phoneticDiscoveries];
   }
 
+  /**
+   * QA #32/#33: Decide whether a phonetic match is worth recording as a "discovery"
+   * for the post-session QA report. Filters out three contamination classes seen
+   * in BG S9: literal name spellings ("L-Y-Z…"), Fate roll readouts, and weak
+   * jaro-winkler-only matches that lack metaphone agreement. Activation/NPC
+   * matching itself is unaffected — only the QA-report record is gated.
+   */
+  private isLikelyPhoneticDiscovery(textLower: string, pm: PhoneticMatch): boolean {
+    const minSim = pm.matchType === 'metaphone'
+      ? DISCOVERY_MIN_METAPHONE_SIM
+      : DISCOVERY_MIN_JW_ONLY_SIM;
+    if (pm.similarity < minSim) return false;
+    if (SPELLING_CUE_PATTERN.test(textLower)) return false;
+    if (FATE_READOUT_PATTERN.test(textLower)) return false;
+    // If the canonical appears verbatim in the same segment, this isn't a garble —
+    // the speaker said the canonical correctly elsewhere. The "discovery" is noise.
+    if (textLower.includes(pm.canonical)) return false;
+    return true;
+  }
+
   /** v4: Reset session-scoped state (phonetic discoveries, activation window, pacing gates). */
   resetSession(): void {
     this._phoneticDiscoveries = [];
@@ -588,7 +620,10 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
         if (!matchedCanonicals.has(pm.canonical)) {
           matchedCanonicals.add(pm.canonical);
           this.activationWindow.push({ canonical: pm.canonical, timestamp: now, weight: 0.5 });
-          if (this._phoneticDiscoveries.length < MAX_PHONETIC_DISCOVERIES) {
+          if (
+            this._phoneticDiscoveries.length < MAX_PHONETIC_DISCOVERIES &&
+            this.isLikelyPhoneticDiscovery(textLower, pm)
+          ) {
             this._phoneticDiscoveries.push({ input: pm.input, canonical: pm.canonical, similarity: pm.similarity });
           }
           logger.debug(`TriggerDetector: phonetic match "${pm.input}" → "${pm.canonical}" (${pm.similarity.toFixed(2)} ${pm.matchType})`);
@@ -654,7 +689,10 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
         );
         if (pm) {
           matched = true;
-          if (this._phoneticDiscoveries.length < MAX_PHONETIC_DISCOVERIES) {
+          if (
+            this._phoneticDiscoveries.length < MAX_PHONETIC_DISCOVERIES &&
+            this.isLikelyPhoneticDiscovery(textLower, pm)
+          ) {
             this._phoneticDiscoveries.push({ input: pm.input, canonical: pm.canonical, similarity: pm.similarity });
           }
           logger.info(`TriggerDetector: NPC phonetic match "${pm.input}" → "${npc.display_name}" (${pm.similarity.toFixed(2)})`);
