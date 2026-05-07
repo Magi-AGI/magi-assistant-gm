@@ -394,8 +394,16 @@ export function formatQaReport(report: QaReport): string {
   // Advice delivery
   lines.push('');
   lines.push(`Advice Delivered: ${report.stats.adviceDelivered}`);
+  // QA #34: Discord is the Foundry-failure fallback path (see output/index.ts
+  // header comment), so a zero Discord count alongside non-zero Foundry is the
+  // healthy outcome. Only surface the Discord count when it actually fired —
+  // an always-zero line was previously misread as broken delivery.
   if (report.stats.adviceViaFoundry > 0 || report.stats.adviceViaDiscord > 0) {
-    lines.push(`  Foundry: ${report.stats.adviceViaFoundry}, Discord: ${report.stats.adviceViaDiscord}`);
+    const parts: string[] = [`Foundry: ${report.stats.adviceViaFoundry}`];
+    if (report.stats.adviceViaDiscord > 0) {
+      parts.push(`Discord (fallback): ${report.stats.adviceViaDiscord}`);
+    }
+    lines.push(`  ${parts.join(', ')}`);
   }
   if (report.stats.adviceSuppressed > 0) {
     const total = report.stats.adviceDelivered + report.stats.adviceSuppressed;
