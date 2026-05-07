@@ -86,6 +86,29 @@ const DISCOVERY_MIN_JW_ONLY_SIM = 0.85;
 const SPELLING_CUE_PATTERN = /\b(?:spelled?|spelling|that['']?s\s+(?:[a-z]\s+){2,}|[a-z](?:[\s-][a-z]){3,})\b/i;
 const FATE_READOUT_PATTERN = /(?:\b(?:plus|minus)\s+\d+\b|\bladder\b|[+−-]\s?\d\b|\brolled?\s+\w+\s+(?:plus|minus|\+|-)\s?\d)/i;
 
+/**
+ * QA #32/#33: Decide whether a phonetic match is worth recording as a "discovery"
+ * for the post-session QA report. Filters out three contamination classes seen in
+ * BG S9: literal name spellings ("L-Y-Z…"), Fate roll readouts, and weak
+ * jaro-winkler-only matches that lack metaphone agreement. Activation/NPC
+ * matching itself is unaffected — only the QA-report record is gated.
+ *
+ * Pure function (no instance state) so the QA regression suite can call it
+ * directly with synthetic and snapshot inputs.
+ */
+export function isLikelyPhoneticDiscovery(textLower: string, pm: PhoneticMatch): boolean {
+  const minSim = pm.matchType === 'metaphone'
+    ? DISCOVERY_MIN_METAPHONE_SIM
+    : DISCOVERY_MIN_JW_ONLY_SIM;
+  if (pm.similarity < minSim) return false;
+  if (SPELLING_CUE_PATTERN.test(textLower)) return false;
+  if (FATE_READOUT_PATTERN.test(textLower)) return false;
+  // If the canonical appears verbatim in the same segment, this isn't a garble —
+  // the speaker said the canonical correctly elsewhere. The "discovery" is noise.
+  if (textLower.includes(pm.canonical)) return false;
+  return true;
+}
+
 const FLOWING_RP_MIN_SPEAKERS = 2;
 const FLOWING_RP_MIN_SEGMENTS = 4;
 const FLOWING_RP_WINDOW_MS = 60_000; // 60s
@@ -384,26 +407,6 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
     return [...this._phoneticDiscoveries];
   }
 
-  /**
-   * QA #32/#33: Decide whether a phonetic match is worth recording as a "discovery"
-   * for the post-session QA report. Filters out three contamination classes seen
-   * in BG S9: literal name spellings ("L-Y-Z…"), Fate roll readouts, and weak
-   * jaro-winkler-only matches that lack metaphone agreement. Activation/NPC
-   * matching itself is unaffected — only the QA-report record is gated.
-   */
-  private isLikelyPhoneticDiscovery(textLower: string, pm: PhoneticMatch): boolean {
-    const minSim = pm.matchType === 'metaphone'
-      ? DISCOVERY_MIN_METAPHONE_SIM
-      : DISCOVERY_MIN_JW_ONLY_SIM;
-    if (pm.similarity < minSim) return false;
-    if (SPELLING_CUE_PATTERN.test(textLower)) return false;
-    if (FATE_READOUT_PATTERN.test(textLower)) return false;
-    // If the canonical appears verbatim in the same segment, this isn't a garble —
-    // the speaker said the canonical correctly elsewhere. The "discovery" is noise.
-    if (textLower.includes(pm.canonical)) return false;
-    return true;
-  }
-
   /** v4: Reset session-scoped state (phonetic discoveries, activation window, pacing gates). */
   resetSession(): void {
     this._phoneticDiscoveries = [];
@@ -622,7 +625,7 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
           this.activationWindow.push({ canonical: pm.canonical, timestamp: now, weight: 0.5 });
           if (
             this._phoneticDiscoveries.length < MAX_PHONETIC_DISCOVERIES &&
-            this.isLikelyPhoneticDiscovery(textLower, pm)
+            isLikelyPhoneticDiscovery(textLower, pm)
           ) {
             this._phoneticDiscoveries.push({ input: pm.input, canonical: pm.canonical, similarity: pm.similarity });
           }
@@ -691,7 +694,7 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
           matched = true;
           if (
             this._phoneticDiscoveries.length < MAX_PHONETIC_DISCOVERIES &&
-            this.isLikelyPhoneticDiscovery(textLower, pm)
+            isLikelyPhoneticDiscovery(textLower, pm)
           ) {
             this._phoneticDiscoveries.push({ input: pm.input, canonical: pm.canonical, similarity: pm.similarity });
           }
