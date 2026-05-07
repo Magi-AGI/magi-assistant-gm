@@ -25,7 +25,7 @@ import {
   SUPPRESSED_SAMPLE_CAP,
   type SuppressedSample,
 } from '../src/qa/session-stats.js';
-import { formatQaReport, type QaReport } from '../src/qa/post-session.js';
+import { formatQaReport, computeSpeakerStats, type QaReport } from '../src/qa/post-session.js';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
@@ -278,6 +278,139 @@ console.log('\n── PR 2: formatQaReport bin/sample lines ──────�
   assert(formatted.includes('flowing_rp'), 'sample renders gate value');
   assert(formatted.includes('[PACING]'), 'sample renders advice tag when present');
   assert(formatted.includes('"consider intercut"'), 'sample renders advice text snippet');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PR 3b — speaker enumeration + final-only + time-weighted (#36 + Pattern 40)
+// ═══════════════════════════════════════════════════════════════════════════
+
+console.log('\n── PR 3b: computeSpeakerStats ──────────────────────────────');
+
+function transcriptRow(
+  speaker: { displayName?: string; userId?: string },
+  startSec: number,
+  durSec: number,
+  isFinal: boolean,
+): any {
+  const start = new Date(Date.UTC(2026, 4, 5, 21, 0, startSec)).toISOString();
+  const end = new Date(Date.UTC(2026, 4, 5, 21, 0, startSec + durSec)).toISOString();
+  return {
+    type: 'transcript',
+    timestamp: start,
+    segmentEnd: end,
+    userId: speaker.userId ?? null,
+    displayName: speaker.displayName ?? null,
+    content: 'sample',
+    isFinal,
+  };
+}
+
+{
+  // Pattern 40: same speaker emits 1 final and 4 interims for the same phrase.
+  // segmentsAll inflates 5x; segmentsFinal stays accurate; speakingMs uses
+  // the final's duration only.
+  const lake = { displayName: 'Lake' };
+  const honeybear = { displayName: 'Honeybear' };
+  const timeline = [
+    transcriptRow(lake, 0, 10, false),
+    transcriptRow(lake, 0, 10, false),
+    transcriptRow(lake, 0, 10, false),
+    transcriptRow(lake, 0, 10, false),
+    transcriptRow(lake, 0, 10, true),
+    transcriptRow(honeybear, 11, 5, false),
+    transcriptRow(honeybear, 11, 5, true),
+  ];
+
+  const stats = computeSpeakerStats(timeline);
+  assert(stats.Lake.segmentsAll === 5, 'Lake all-segments inflated by interims (5)');
+  assert(stats.Lake.segmentsFinal === 1, 'Lake final-only is 1');
+  assert(stats.Lake.speakingMs === 10_000, 'Lake speakingMs from final segment duration');
+  assert(stats.Honeybear.segmentsAll === 2, 'Honeybear all-segments (2)');
+  assert(stats.Honeybear.segmentsFinal === 1, 'Honeybear final-only is 1');
+  assert(stats.Honeybear.speakingMs === 5_000, 'Honeybear speakingMs from final segment duration');
+}
+
+{
+  // QA #36 early-leaver: Rachel speaks during the first half then disconnects.
+  // She should still appear in the speaker enumeration (not filtered by an
+  // end-of-session active check).
+  const rachel = { displayName: 'Rachel' };
+  const russell = { displayName: 'Russell' };
+  const timeline = [
+    transcriptRow(rachel, 0, 8, true),
+    transcriptRow(rachel, 30, 6, true),
+    // Rachel disconnects here.
+    transcriptRow(russell, 60, 10, true),
+    transcriptRow(russell, 90, 10, true),
+    transcriptRow(russell, 120, 10, true),
+  ];
+
+  const stats = computeSpeakerStats(timeline);
+  assert('Rachel' in stats, 'early-leaver Rachel still enumerated post-session');
+  assert(stats.Rachel.segmentsFinal === 2, 'Rachel final segment count is correct');
+  assert(stats.Rachel.speakingMs === 14_000, 'Rachel airtime sums her final-segment durations');
+}
+
+{
+  // Rows missing segmentEnd contribute 0 ms airtime, but still count toward
+  // segmentsFinal — so the airtime metric degrades gracefully on legacy data
+  // without polluting segment counts.
+  const lake = { displayName: 'Lake' };
+  const timeline: any[] = [
+    transcriptRow(lake, 0, 10, true),
+    { type: 'transcript', timestamp: new Date().toISOString(), segmentEnd: null, userId: 'u', displayName: 'Lake', content: 'x', isFinal: true },
+  ];
+  const stats = computeSpeakerStats(timeline);
+  assert(stats.Lake.segmentsFinal === 2, 'final segments counted even when segmentEnd is null');
+  assert(stats.Lake.speakingMs === 10_000, 'segmentEnd=null contributes 0 ms airtime');
+}
+
+{
+  // Text events should be ignored when computing speaker stats.
+  const lake = { displayName: 'Lake' };
+  const timeline: any[] = [
+    transcriptRow(lake, 0, 5, true),
+    { type: 'text', timestamp: new Date().toISOString(), userId: 'u', displayName: 'Lake', content: 'typed' },
+  ];
+  const stats = computeSpeakerStats(timeline);
+  assert(stats.Lake.segmentsAll === 1, 'text-channel rows do not increment segmentsAll');
+}
+
+// formatQaReport renders three-metric rows when speakerStats is present.
+
+console.log('\n── PR 3b: formatQaReport speaker block ─────────────────────');
+
+{
+  const stats = createSessionStats();
+  stats.adviceDelivered = 7;
+  const report: QaReport = {
+    durationMinutes: 240,
+    segmentCount: 9,
+    speakerCount: 3,
+    speakerDistribution: { Lake: 5, Honeybear: 2, Russell: 2 },
+    speakerStats: {
+      Lake:      { segmentsAll: 5, segmentsFinal: 1, speakingMs: 30_000 },
+      Honeybear: { segmentsAll: 2, segmentsFinal: 1, speakingMs: 25_000 },
+      Russell:   { segmentsAll: 2, segmentsFinal: 1, speakingMs: 25_000 },
+    },
+    speakerStatsSource: 'mcp_timeline',
+    stats,
+    phoneticDiscoveries: [],
+    fuzzyTableDelta: {},
+    fuzzyTablePersisted: false,
+  };
+
+  const formatted = formatQaReport(report);
+  assert(formatted.includes('all-seg / final-only / airtime'), 'speaker header lists all three metrics');
+  assert(formatted.includes('Lake: 56% / 33% / 38%'), 'Lake renders three percentages');
+  assert(!formatted.includes('source: mcp_timeline'), 'mcp_timeline source label suppressed (preferred path)');
+
+  // Fallback path surfaces the source label so a reader knows the metric is
+  // running on the legacy in-memory accumulator (single column).
+  const fallback: QaReport = { ...report, speakerStats: undefined, speakerStatsSource: 'realtime_stats' };
+  const fallbackFormatted = formatQaReport(fallback);
+  assert(fallbackFormatted.includes('Speakers:'), 'fallback renders single-metric Speakers row');
+  assert(!fallbackFormatted.includes('all-seg / final-only / airtime'), 'fallback omits three-metric header');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

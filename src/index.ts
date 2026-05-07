@@ -237,6 +237,7 @@ async function stopSessionLoops(): Promise<void> {
       sessionStats,
       currentFuzzyTable,
       phoneticDiscoveries,
+      lastSessionId ?? undefined,
     );
 
     // Merge persisted delta into in-memory fuzzy table so next session won't re-persist
