@@ -19,6 +19,13 @@
 
 import { isLikelyPhoneticDiscovery } from '../src/reasoning/triggers.js';
 import type { PhoneticMatch } from '../src/matching/phonetic.js';
+import {
+  createSessionStats,
+  recordSuppression,
+  SUPPRESSED_SAMPLE_CAP,
+  type SuppressedSample,
+} from '../src/qa/session-stats.js';
+import { formatQaReport, type QaReport } from '../src/qa/post-session.js';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
@@ -158,6 +165,120 @@ assert(
   ),
   'clean fiction text without Fate cues still records',
 );
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PR 2 — suppression bins + reservoir sampling (#35)
+// ═══════════════════════════════════════════════════════════════════════════
+
+console.log('\n── PR 2: recordSuppression and reservoir sampling ──────────');
+
+function sample(reason: SuppressedSample['reason'], extra: Partial<SuppressedSample> = {}): SuppressedSample {
+  return {
+    reason,
+    timestamp: '2026-05-05T12:00:00.000Z',
+    eventTypes: ['gm_question'],
+    priority: 1,
+    ...extra,
+  };
+}
+
+{
+  const stats = createSessionStats();
+  recordSuppression(stats, sample('already_covered', { adviceTag: 'PACING' }));
+  recordSuppression(stats, sample('duplicate'));
+  recordSuppression(stats, sample('timing_window', { gateValues: { gate: 'flowing_rp' } }));
+  recordSuppression(stats, sample('below_confidence'));
+  recordSuppression(stats, sample('already_covered'));
+
+  assert(stats.adviceSuppressed === 5, 'adviceSuppressed counts every recorded suppression');
+  assert(stats.suppressedByReason.already_covered === 2, 'already_covered bin sums correctly');
+  assert(stats.suppressedByReason.duplicate === 1, 'duplicate bin');
+  assert(stats.suppressedByReason.timing_window === 1, 'timing_window bin');
+  assert(stats.suppressedByReason.below_confidence === 1, 'below_confidence bin');
+  assert(
+    stats.adviceSuppressed === Object.values(stats.suppressedByReason).reduce((a, b) => a + b, 0),
+    'adviceSuppressed equals sum of bins',
+  );
+  assert(stats.suppressedSamples.length === 5, 'all samples kept under cap');
+}
+
+{
+  // Reservoir sampling: under cap, every sample retained.
+  const stats = createSessionStats();
+  for (let i = 0; i < SUPPRESSED_SAMPLE_CAP; i++) {
+    recordSuppression(stats, sample('duplicate', { adviceTag: `T${i}` }));
+  }
+  assert(
+    stats.suppressedSamples.length === SUPPRESSED_SAMPLE_CAP,
+    `under-cap fill keeps all ${SUPPRESSED_SAMPLE_CAP} samples`,
+  );
+
+  // Beyond cap: reservoir size stays at cap, count keeps growing.
+  for (let i = 0; i < 50; i++) {
+    recordSuppression(stats, sample('duplicate', { adviceTag: `O${i}` }));
+  }
+  assert(
+    stats.suppressedSamples.length === SUPPRESSED_SAMPLE_CAP,
+    'over-cap reservoir stays at cap size',
+  );
+  assert(stats.suppressedSeenCount === SUPPRESSED_SAMPLE_CAP + 50, 'suppressedSeenCount tracks all suppressions');
+  assert(stats.adviceSuppressed === SUPPRESSED_SAMPLE_CAP + 50, 'adviceSuppressed continues counting past cap');
+}
+
+{
+  // Determinism: with random=()=>0 the first cap entries are filled, then every
+  // subsequent suppression replaces index 0 (since floor(0 * seenCount) === 0).
+  const stats = createSessionStats();
+  for (let i = 0; i < SUPPRESSED_SAMPLE_CAP; i++) {
+    recordSuppression(stats, sample('duplicate', { adviceTag: `under_${i}` }), () => 0);
+  }
+  recordSuppression(stats, sample('duplicate', { adviceTag: 'overflow' }), () => 0);
+  assert(
+    stats.suppressedSamples[0].adviceTag === 'overflow',
+    'random=0 → overflow replaces index 0 (Algorithm R)',
+  );
+  assert(
+    stats.suppressedSamples[1].adviceTag === 'under_1',
+    'random=0 → indices ≥1 untouched on overflow',
+  );
+}
+
+// formatQaReport surfaces bins and sampled suppressions.
+
+console.log('\n── PR 2: formatQaReport bin/sample lines ───────────────────');
+
+{
+  const stats = createSessionStats();
+  stats.adviceDelivered = 7;
+  stats.adviceViaFoundry = 7;
+  recordSuppression(stats, sample('already_covered', { adviceTag: 'PACING', adviceText: 'consider intercut' }));
+  recordSuppression(stats, sample('already_covered'));
+  recordSuppression(stats, sample('duplicate', { adviceTag: 'NPC' }));
+  recordSuppression(stats, sample('timing_window', { eventTypes: ['gm_hesitation'], priority: 3, gateValues: { gate: 'flowing_rp' } }));
+  recordSuppression(stats, sample('below_confidence'));
+
+  const report: QaReport = {
+    durationMinutes: 240,
+    segmentCount: 1500,
+    speakerCount: 4,
+    speakerDistribution: { GM: 100, P1: 50, P2: 30, P3: 20 },
+    stats,
+    phoneticDiscoveries: [],
+    fuzzyTableDelta: {},
+    fuzzyTablePersisted: false,
+  };
+
+  const formatted = formatQaReport(report);
+  assert(formatted.includes('Suppressed: 5'), 'report shows total suppression count');
+  assert(formatted.includes('already-covered: 2'), 'report shows already-covered bin');
+  assert(formatted.includes('duplicate: 1'), 'report shows duplicate bin');
+  assert(formatted.includes('timing-window: 1'), 'report shows timing-window bin');
+  assert(formatted.includes('below-confidence: 1'), 'report shows below-confidence bin');
+  assert(formatted.includes('Sampled suppressions:'), 'report includes sampled suppression header');
+  assert(formatted.includes('flowing_rp'), 'sample renders gate value');
+  assert(formatted.includes('[PACING]'), 'sample renders advice tag when present');
+  assert(formatted.includes('"consider intercut"'), 'sample renders advice text snippet');
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Snapshot-driven regressions (real session data, when captured)

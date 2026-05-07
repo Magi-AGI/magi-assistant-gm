@@ -9,6 +9,23 @@ export enum AssistantState {
   SLEEP = 'SLEEP',
 }
 
+/**
+ * QA #35: Why an advice candidate was dropped before delivery.
+ *
+ * - already_covered: Claude returned the NO_ADVICE sentinel (the model decided
+ *   the situation was already handled by recent advice or live GM speech).
+ * - duplicate: post-LLM dedup hit AdviceMemoryBuffer.isDuplicate.
+ * - timing_window: trigger-layer suppression — flowing-RP, GAP cap, or
+ *   Foundry-scene-change window prevented the candidate from reaching the LLM.
+ * - below_confidence: Claude returned an empty response (no text blocks),
+ *   treated as the model implicitly signalling low confidence.
+ */
+export type SuppressionReason =
+  | 'already_covered'
+  | 'duplicate'
+  | 'timing_window'
+  | 'below_confidence';
+
 // Trigger Priority (lower number = higher priority)
 
 export enum TriggerPriority {

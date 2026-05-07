@@ -239,7 +239,38 @@ export function formatQaReport(report: QaReport): string {
     lines.push(`  Foundry: ${report.stats.adviceViaFoundry}, Discord: ${report.stats.adviceViaDiscord}`);
   }
   if (report.stats.adviceSuppressed > 0) {
-    lines.push(`  Suppressed (dedup/NO_ADVICE): ${report.stats.adviceSuppressed}`);
+    const total = report.stats.adviceDelivered + report.stats.adviceSuppressed;
+    const pct = total > 0 ? Math.round((report.stats.adviceSuppressed / total) * 100) : 0;
+    lines.push(`  Suppressed: ${report.stats.adviceSuppressed} (${pct}% of candidates)`);
+    const bins = report.stats.suppressedByReason;
+    const binParts: string[] = [];
+    if (bins.already_covered > 0) binParts.push(`already-covered: ${bins.already_covered}`);
+    if (bins.below_confidence > 0) binParts.push(`below-confidence: ${bins.below_confidence}`);
+    if (bins.timing_window > 0) binParts.push(`timing-window: ${bins.timing_window}`);
+    if (bins.duplicate > 0) binParts.push(`duplicate: ${bins.duplicate}`);
+    if (binParts.length > 0) lines.push(`    ${binParts.join(', ')}`);
+
+    // QA #35: surface up to 8 sampled suppressions (with the reservoir already
+    // uniformly sampled across the session) so a human can sanity-check the
+    // per-candidate decisions instead of trusting bin totals alone.
+    const SAMPLE_LIMIT = 8;
+    const samples = report.stats.suppressedSamples.slice(0, SAMPLE_LIMIT);
+    if (samples.length > 0) {
+      lines.push('  Sampled suppressions:');
+      for (const s of samples) {
+        const ts = s.timestamp.slice(11, 16); // HH:MM
+        const events = s.eventTypes.join('+');
+        const advice = s.adviceTag ? ` [${s.adviceTag}]` : '';
+        const adviceSnippet = s.adviceText ? ` "${s.adviceText.slice(0, 60).replace(/\s+/g, ' ')}"` : '';
+        const gates = s.gateValues
+          ? ' ' + Object.entries(s.gateValues).map(([k, v]) => `${k}=${v}`).join(',')
+          : '';
+        lines.push(`    ${ts} P${s.priority} ${s.reason} (${events})${advice}${adviceSnippet}${gates}`);
+      }
+      if (report.stats.suppressedSamples.length > SAMPLE_LIMIT) {
+        lines.push(`    … ${report.stats.suppressedSamples.length - SAMPLE_LIMIT} more sampled (full set in stats)`);
+      }
+    }
   }
 
   // Activation
