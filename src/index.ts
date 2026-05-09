@@ -35,7 +35,7 @@ import { WhisperStager } from './reasoning/whisper-stage.js';
 import { AdviceDelivery } from './output/index.js';
 import { ImageQueue } from './output/image-queue.js';
 import { parseGmCommand } from './state/gm-commands.js';
-import { createSessionStats, type SessionStats } from './qa/session-stats.js';
+import { createSessionStats, recordSuppression, type SessionStats, type SuppressedSample } from './qa/session-stats.js';
 import { runPostSessionQa, formatQaReport } from './qa/post-session.js';
 import { AssistantState, TriggerPriority } from './types/index.js';
 import type { ActivationSource, NpcCacheEntry, SceneIndexEntry, BeatReminderEntry, WhisperStageEntry } from './types/index.js';
@@ -237,6 +237,7 @@ async function stopSessionLoops(): Promise<void> {
       sessionStats,
       currentFuzzyTable,
       phoneticDiscoveries,
+      lastSessionId ?? undefined,
     );
 
     // Merge persisted delta into in-memory fuzzy table so next session won't re-persist
@@ -1239,6 +1240,17 @@ async function main(): Promise<void> {
     handleActivation(source);
   });
 
+  // QA #35: trigger-layer gate suppressions (flowing-RP, GAP cap, scene-window).
+  triggers.on('suppressed', (info) => {
+    recordSuppression(sessionStats, {
+      reason: info.reason,
+      timestamp: new Date().toISOString(),
+      eventTypes: [info.eventType],
+      priority: info.priority,
+      gateValues: info.gateValues,
+    });
+  });
+
   triggers.on('trigger', async (batch) => {
     if (!engine || !delivery) return;
 
@@ -1295,19 +1307,26 @@ async function main(): Promise<void> {
         events: otherEvents,
         flushedAt: batch.flushedAt,
       };
-      const envelope = await engine.process(remainingBatch);
-      if (envelope) {
-        if (envelope.image) {
-          imageQueue.setPending(envelope.image);
+      const result = await engine.process(remainingBatch);
+      if (result.kind === 'advice') {
+        if (result.envelope.image) {
+          imageQueue.setPending(result.envelope.image);
         }
-        const channel = await delivery.deliver(envelope);
+        const channel = await delivery.deliver(result.envelope);
         trackDelivery(channel);
-      } else {
-        sessionStats.adviceSuppressed++;
+      } else if (result.kind === 'suppressed') {
+        const sample: SuppressedSample = {
+          reason: result.reason,
+          timestamp: new Date().toISOString(),
+          eventTypes: otherEvents.map(e => e.type),
+          priority: Math.min(...otherEvents.map(e => e.priority)),
+          adviceText: result.envelope?.body ?? undefined,
+          adviceTag: result.envelope?.tag,
+        };
+        recordSuppression(sessionStats, sample);
       }
-    } else if (beatEvents.length === 0 && whisperEvents.length === 0) {
-      // Empty batch after filtering — should not happen, but handle gracefully
-      sessionStats.adviceSuppressed++;
+      // result.kind === 'deferred' is intentionally untracked — the queued
+      // batch will be reprocessed by the engine's drainQueue path.
     }
   });
 

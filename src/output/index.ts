@@ -8,6 +8,14 @@
  * 4. Periodic reminder every 30 minutes while Foundry is down (event-driven:
  *    reminders fire on advice delivery attempts, not a wall-clock timer).
  * 5. On Foundry reconnection: post recovery notice to Discord.
+ *
+ * QA #34: the Discord channel is a fallback path, not an independent delivery
+ * route. A session that delivers 100% via Foundry — and therefore reports
+ * adviceViaDiscord=0 in SessionStats — is the healthy, expected outcome. The
+ * post-session QA report formatter (qa/post-session.ts) labels the Discord
+ * count "(fallback)" and suppresses the row entirely when zero, so the
+ * always-zero line that flagged this in the BG S8 + S9 reviews no longer
+ * looks like dead code.
  */
 
 import { getConfig } from '../config.js';

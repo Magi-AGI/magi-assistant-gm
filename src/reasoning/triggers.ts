@@ -29,13 +29,21 @@ import { logger } from '../logger.js';
 import { getConfig } from '../config.js';
 import { PhoneticMatcher, type PhoneticMatch } from '../matching/phonetic.js';
 import type { PacingStateManager } from '../state/pacing.js';
-import type { NpcCacheEntry, SceneIndexEntry, BeatReminderEntry, WhisperStageEntry, ActivationSource } from '../types/index.js';
+import type { NpcCacheEntry, SceneIndexEntry, BeatReminderEntry, WhisperStageEntry, ActivationSource, TriggerType } from '../types/index.js';
 import {
   AssistantState,
   TriggerPriority,
   TriggerEvent,
   TriggerBatch,
 } from '../types/index.js';
+
+/** QA #35: payload emitted when the trigger layer drops an event before it reaches the engine. */
+export interface TriggerSuppressionInfo {
+  reason: 'timing_window';
+  eventType: TriggerType;
+  priority: TriggerPriority;
+  gateValues: Record<string, string | number | boolean>;
+}
 
 // ── P1 keyword patterns ────────────────────────────────────────────────────
 
@@ -120,6 +128,8 @@ export interface TriggerDetectorEvents {
   trigger: [batch: TriggerBatch];
   /** v3: Emitted when PREGAME→ACTIVE should occur. Orchestrator handles transition + cache build. */
   activated: [source: ActivationSource];
+  /** QA #35: emitted when a trigger-layer gate drops an event before it reaches the engine. */
+  suppressed: [info: TriggerSuppressionInfo];
 }
 
 /**
@@ -514,9 +524,20 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
 
       // P3: Scene transition keywords (ACTIVE only, v7: downgraded from P2, suppressed near Foundry scene change)
       if (this.pacing.assistantState === AssistantState.ACTIVE && this.isSceneTransitionKeyword(seg.text)) {
-        const recentFoundryChange = Math.abs(Date.now() - this.lastFoundrySceneChangeTime) < 30_000;
+        const sinceFoundryMs = Math.abs(Date.now() - this.lastFoundrySceneChangeTime);
+        const recentFoundryChange = sinceFoundryMs < 30_000;
         if (recentFoundryChange) {
           logger.debug('TriggerDetector: suppressing transcript scene transition (Foundry scene change within 30s)');
+          this.emit('suppressed', {
+            reason: 'timing_window',
+            eventType: 'scene_transition',
+            priority: TriggerPriority.P3,
+            gateValues: {
+              gate: 'foundry_scene_change_window',
+              sinceFoundryChangeSec: Math.round(sinceFoundryMs / 1000),
+              windowSec: 30,
+            },
+          });
         } else {
           logger.info(`TriggerDetector: P3 scene transition keyword — "${seg.text.trim().slice(0, 80)}"`);
           this.addEvent({
@@ -941,12 +962,28 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
       // v6: Per-session GAP cap
       if (this.maxGapTriggersPerSession > 0 && this.gapTriggerCount >= this.maxGapTriggersPerSession) {
         logger.debug(`TriggerDetector: hesitation suppressed (GAP cap ${this.maxGapTriggersPerSession} reached)`);
+        this.emit('suppressed', {
+          reason: 'timing_window',
+          eventType: 'gm_hesitation',
+          priority: TriggerPriority.P3,
+          gateValues: {
+            gate: 'gap_cap',
+            gapCount: this.gapTriggerCount,
+            gapCap: this.maxGapTriggersPerSession,
+          },
+        });
         return;
       }
 
       // v6: Suppress during flowing RP (same as P3/P4)
       if (this.isFlowingRP()) {
         logger.debug('TriggerDetector: hesitation suppressed (flowing RP)');
+        this.emit('suppressed', {
+          reason: 'timing_window',
+          eventType: 'gm_hesitation',
+          priority: TriggerPriority.P3,
+          gateValues: { gate: 'flowing_rp' },
+        });
         return;
       }
 
@@ -990,6 +1027,12 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
       // Suppress if flowing RP is happening
       if (this.isFlowingRP()) {
         logger.debug('TriggerDetector: P4 suppressed (flowing RP)');
+        this.emit('suppressed', {
+          reason: 'timing_window',
+          eventType: 'silence_detection',
+          priority: TriggerPriority.P4,
+          gateValues: { gate: 'flowing_rp', silenceSec: Math.round(silenceMs / 1000) },
+        });
         return;
       }
 
@@ -1020,6 +1063,16 @@ export class TriggerDetector extends EventEmitter<TriggerDetectorEvents> {
       // Suppress if flowing RP is happening
       if (this.isFlowingRP()) {
         logger.debug('TriggerDetector: P3 suppressed (flowing RP)');
+        this.emit('suppressed', {
+          reason: 'timing_window',
+          eventType: 'pacing_alert',
+          priority: TriggerPriority.P3,
+          gateValues: {
+            gate: 'flowing_rp',
+            scene: String(this.pacing.state.current_scene ?? ''),
+            elapsedMin: this.pacing.state.scene_timing.elapsed_minutes,
+          },
+        });
         return;
       }
 

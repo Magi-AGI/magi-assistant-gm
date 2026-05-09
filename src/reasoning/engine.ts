@@ -13,7 +13,18 @@ import { parseAdviceEnvelope, wrapFreeTextAsEnvelope, isNoAdvice } from './envel
 import type { McpAggregator } from '../mcp/client.js';
 import type { PacingStateManager } from '../state/pacing.js';
 import type { AdviceMemoryBuffer } from '../state/advice-memory.js';
-import type { TriggerBatch, AdviceEnvelope, TriggerPriority, NpcCacheEntry, SceneIndexEntry } from '../types/index.js';
+import type { TriggerBatch, AdviceEnvelope, TriggerPriority, NpcCacheEntry, SceneIndexEntry, SuppressionReason } from '../types/index.js';
+
+/**
+ * QA #35: Reasoning outcome. Discriminates delivered advice from suppression
+ * (with a typed reason and the would-be envelope when one was produced) from
+ * deferred-because-busy. Replaces the prior `AdviceEnvelope | null` return,
+ * which conflated three distinct outcomes and prevented per-reason binning.
+ */
+export type EngineResult =
+  | { kind: 'advice'; envelope: AdviceEnvelope }
+  | { kind: 'suppressed'; reason: SuppressionReason; envelope?: AdviceEnvelope }
+  | { kind: 'deferred' };
 
 const MAX_TOOL_ITERATIONS = 5;
 const MAX_TOOL_RESULT_CHARS = 5000;
@@ -69,17 +80,19 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
 
   /**
    * Process a trigger batch. If already processing, queues the batch
-   * (freshest data wins — overwrites any previously queued batch).
+   * (freshest data wins — overwrites any previously queued batch) and
+   * returns kind:'deferred' so the orchestrator does not count it as a
+   * suppression — the queued batch will run after the current one finishes.
    */
-  async process(batch: TriggerBatch): Promise<AdviceEnvelope | null> {
+  async process(batch: TriggerBatch): Promise<EngineResult> {
     if (this.processing) {
       logger.debug('ReasoningEngine: already processing — queuing batch');
       this.queuedBatch = batch;
-      return null;
+      return { kind: 'deferred' };
     }
 
     this.processing = true;
-    let result: AdviceEnvelope | null = null;
+    let result: EngineResult = { kind: 'suppressed', reason: 'below_confidence' };
     try {
       result = await this.runReasoning(batch);
     } catch (err) {
@@ -100,15 +113,15 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
     // that could hit the org-level rate limit (30k tokens/min).
     const INTER_CALL_DELAY_MS = 10_000;
     setTimeout(() => {
-      this.process(next).then((envelope) => {
-        if (envelope) this.emit('advice', envelope);
+      this.process(next).then((result) => {
+        if (result.kind === 'advice') this.emit('advice', result.envelope);
       }).catch((err) => {
         logger.error('ReasoningEngine: error processing queued batch:', err);
       });
     }, INTER_CALL_DELAY_MS);
   }
 
-  private async runReasoning(batch: TriggerBatch): Promise<AdviceEnvelope | null> {
+  private async runReasoning(batch: TriggerBatch): Promise<EngineResult> {
     const config = getConfig();
 
     try {
@@ -204,7 +217,7 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
 
       if (!adviceText) {
         logger.info('ReasoningEngine: empty response from Claude');
-        return null;
+        return { kind: 'suppressed', reason: 'below_confidence' };
       }
 
       // Parse as JSON envelope
@@ -218,13 +231,13 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
       // Check NO_ADVICE sentinel
       if (isNoAdvice(envelope)) {
         logger.info('ReasoningEngine: Claude returned NO_ADVICE');
-        return null;
+        return { kind: 'suppressed', reason: 'already_covered', envelope };
       }
 
       // Dedup check against memory
       if (this.memory.isDuplicate(envelope)) {
         logger.info(`ReasoningEngine: dedup — suppressing duplicate advice [${envelope.tag}]`);
-        return null;
+        return { kind: 'suppressed', reason: 'duplicate', envelope };
       }
 
       // Anti-echo telemetry: check if advice body substantially overlaps with transcript
@@ -239,10 +252,10 @@ export class ReasoningEngine extends EventEmitter<ReasoningEngineEvents> {
       this.memory.push(envelope);
       logger.info(`ReasoningEngine: generated advice [${envelope.tag}] (${iterations} tool iterations)`);
 
-      return envelope;
+      return { kind: 'advice', envelope };
     } catch (err) {
       logger.error('ReasoningEngine: error during reasoning:', err);
-      return null;
+      return { kind: 'suppressed', reason: 'below_confidence' };
     }
   }
 
