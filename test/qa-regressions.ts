@@ -414,6 +414,54 @@ console.log('\n── PR 3b: formatQaReport speaker block ───────�
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PR 4 — Discord-channel advice fallback documentation (#34)
+// ═══════════════════════════════════════════════════════════════════════════
+
+console.log('\n── PR 4: Discord-fallback row in formatQaReport ────────────');
+
+function reportWith(
+  adviceDelivered: number,
+  adviceViaFoundry: number,
+  adviceViaDiscord: number,
+): QaReport {
+  const stats = createSessionStats();
+  stats.adviceDelivered = adviceDelivered;
+  stats.adviceViaFoundry = adviceViaFoundry;
+  stats.adviceViaDiscord = adviceViaDiscord;
+  return {
+    durationMinutes: 240,
+    segmentCount: 100,
+    speakerCount: 1,
+    speakerDistribution: { GM: 100 },
+    stats,
+    phoneticDiscoveries: [],
+    fuzzyTableDelta: {},
+    fuzzyTablePersisted: false,
+  };
+}
+
+{
+  // BG S8/S9 healthy case: Foundry stayed up the whole session, Discord 0.
+  const formatted = formatQaReport(reportWith(7, 7, 0));
+  assert(formatted.includes('Foundry: 7'), 'Foundry count rendered');
+  assert(!formatted.includes('Discord:'), 'zero Discord-fallback count is suppressed (healthy state)');
+  assert(!formatted.includes('Discord (fallback): 0'), 'no Discord (fallback): 0 line');
+}
+
+{
+  // Foundry-down session: fallback fired, label it explicitly.
+  const formatted = formatQaReport(reportWith(5, 2, 3));
+  assert(formatted.includes('Foundry: 2'), 'Foundry count rendered');
+  assert(formatted.includes('Discord (fallback): 3'), 'non-zero Discord renders with (fallback) label');
+}
+
+{
+  // No advice delivered at all: row is omitted entirely.
+  const formatted = formatQaReport(reportWith(0, 0, 0));
+  assert(!formatted.includes('Foundry:'), 'no advice delivered → row omitted');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Snapshot-driven regressions (real session data, when captured)
 // ═══════════════════════════════════════════════════════════════════════════
 
