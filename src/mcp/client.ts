@@ -33,7 +33,7 @@ export interface McpAggregatorEvents {
 export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
   private servers = new Map<string, ServerConnection>();
   private reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private serverConfigs: Array<{ name: string; url: string; token: string; required: boolean; transport: 'sse' | 'streamable-http' }> = [];
+  private serverConfigs: Array<{ name: string; url: string; token: string; required: boolean; transport: 'sse' | 'streamable-http'; localSecret?: string }> = [];
   private _shuttingDown = false;
   private _cleaningUp = false;
 
@@ -46,16 +46,16 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
 
     this.serverConfigs = [
       { name: 'discord', url: config.discordMcpUrl, token: config.discordMcpToken, required: true, transport: 'sse' },
-      { name: 'foundry', url: config.foundryMcpUrl, token: config.foundryMcpToken, required: false, transport: 'sse' },
+      { name: 'foundry', url: config.foundryMcpUrl, token: config.foundryMcpToken, required: false, transport: 'streamable-http' },
     ];
 
     // v2: Wiki is required (hard gate) — uses Streamable HTTP (wiki SSE transport is send-only)
     if (config.wikiMcpUrl) {
-      this.serverConfigs.push({ name: 'wiki', url: config.wikiMcpUrl, token: config.wikiMcpToken, required: true, transport: 'streamable-http' });
+      this.serverConfigs.push({ name: 'wiki', url: config.wikiMcpUrl, token: config.wikiMcpToken, required: true, transport: 'streamable-http', localSecret: config.wikiMcpLocalSecret });
     }
 
     const results = await Promise.allSettled(
-      this.serverConfigs.map((conn) => this.connectServer(conn.name, conn.url, conn.token, conn.required, conn.transport))
+      this.serverConfigs.map((conn) => this.connectServer(conn.name, conn.url, conn.token, conn.required, conn.transport, conn.localSecret ?? ''))
     );
 
     // Check for required connection failures
@@ -88,8 +88,11 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
     }
   }
 
-  private async connectServer(name: string, baseUrl: string, token: string, required: boolean, transportType: 'sse' | 'streamable-http' = 'sse'): Promise<void> {
+  private async connectServer(name: string, baseUrl: string, token: string, required: boolean, transportType: 'sse' | 'streamable-http' = 'sse', localSecret = ''): Promise<void> {
     const authHeaders: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+    // Same-box trusted-caller bypass: present the shared secret so the wiki MCP
+    // server's hardened gate grants the default identity without an OAuth token.
+    if (localSecret) authHeaders['X-MCP-Local'] = localSecret;
 
     let transport: SSEClientTransport | StreamableHTTPClientTransport;
     if (transportType === 'streamable-http') {
@@ -143,7 +146,7 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
       if (this._shuttingDown || this._cleaningUp) return;
       logger.warn(`MCP aggregator: lost connection to '${name}' — scheduling reconnect`);
       this.servers.delete(name);
-      this.scheduleReconnect(name, baseUrl, token, required, transportType);
+      this.scheduleReconnect(name, baseUrl, token, required, transportType, localSecret);
     };
 
     transport.onerror = (err) => {
@@ -153,7 +156,7 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
     };
   }
 
-  private scheduleReconnect(name: string, baseUrl: string, token: string, required: boolean, transportType: 'sse' | 'streamable-http' = 'sse', attempt = 1): void {
+  private scheduleReconnect(name: string, baseUrl: string, token: string, required: boolean, transportType: 'sse' | 'streamable-http' = 'sse', localSecret = '', attempt = 1): void {
     if (this._shuttingDown) return;
     if (this.reconnectTimers.has(name)) return; // Already scheduled
 
@@ -164,11 +167,11 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
     const timer = setTimeout(async () => {
       this.reconnectTimers.delete(name);
       try {
-        await this.connectServer(name, baseUrl, token, required, transportType);
+        await this.connectServer(name, baseUrl, token, required, transportType, localSecret);
         logger.info(`MCP aggregator: reconnected to '${name}'`);
       } catch (err) {
         logger.warn(`MCP aggregator: reconnect to '${name}' failed:`, err);
-        this.scheduleReconnect(name, baseUrl, token, required, transportType, attempt + 1);
+        this.scheduleReconnect(name, baseUrl, token, required, transportType, localSecret, attempt + 1);
       }
     }, delay);
 
