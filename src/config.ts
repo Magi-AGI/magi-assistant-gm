@@ -16,6 +16,8 @@ export interface GmConfig {
   discordMcpToken: string;
   foundryMcpToken: string;
   wikiMcpToken: string;
+  // Shared secret for the wiki MCP same-box trusted-caller bypass (X-MCP-Local)
+  wikiMcpLocalSecret: string;
 
   // Output
   discordAdviceWebhookUrl: string;
@@ -136,6 +138,7 @@ export function getConfig(): GmConfig {
   const discordMcpToken = process.env.DISCORD_MCP_TOKEN ?? '';
   const foundryMcpToken = process.env.FOUNDRY_MCP_TOKEN ?? '';
   const wikiMcpToken = process.env.WIKI_MCP_TOKEN ?? '';
+  const wikiMcpLocalSecret = process.env.WIKI_MCP_LOCAL_SECRET ?? '';
 
   // Register secrets for log redaction
   if (anthropicApiKey) registerSecret(anthropicApiKey);
@@ -159,6 +162,7 @@ export function getConfig(): GmConfig {
     discordMcpToken,
     foundryMcpToken,
     wikiMcpToken,
+    wikiMcpLocalSecret,
 
     discordAdviceWebhookUrl: process.env.DISCORD_ADVICE_WEBHOOK_URL ?? '',
 
