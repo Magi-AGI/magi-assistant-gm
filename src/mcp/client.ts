@@ -26,6 +26,53 @@ interface ServerConnection {
   required: boolean;
 }
 
+export type McpTransportType = 'sse' | 'streamable-http';
+
+export interface McpServerConfig {
+  name: string;
+  url: string;
+  token: string;
+  required: boolean;
+  transport: McpTransportType;
+  localSecret?: string;
+}
+
+/**
+ * HTTP path each transport connects on, relative to the server base URL.
+ * Discord, Foundry, and Wiki MCP servers all expose StreamableHTTP at /mcp;
+ * SSE (send-only) remains supported for any legacy /sse endpoint.
+ */
+export function mcpEndpointPath(transport: McpTransportType): '/mcp' | '/sse' {
+  return transport === 'streamable-http' ? '/mcp' : '/sse';
+}
+
+/**
+ * Build the MCP server connection list from resolved config. Pure — no I/O.
+ * Discord + Foundry + Wiki all speak StreamableHTTP (/mcp); Discord previously
+ * defaulted to SSE (/sse), which broke once its server moved to StreamableHTTP.
+ */
+export function buildServerConfigs(config: {
+  discordMcpUrl: string;
+  discordMcpToken: string;
+  foundryMcpUrl: string;
+  foundryMcpToken: string;
+  wikiMcpUrl: string;
+  wikiMcpToken: string;
+  wikiMcpLocalSecret: string;
+}): McpServerConfig[] {
+  const configs: McpServerConfig[] = [
+    { name: 'discord', url: config.discordMcpUrl, token: config.discordMcpToken, required: true, transport: 'streamable-http' },
+    { name: 'foundry', url: config.foundryMcpUrl, token: config.foundryMcpToken, required: false, transport: 'streamable-http' },
+  ];
+
+  // v2: Wiki is required (hard gate) — uses Streamable HTTP (wiki SSE transport is send-only)
+  if (config.wikiMcpUrl) {
+    configs.push({ name: 'wiki', url: config.wikiMcpUrl, token: config.wikiMcpToken, required: true, transport: 'streamable-http', localSecret: config.wikiMcpLocalSecret });
+  }
+
+  return configs;
+}
+
 export interface McpAggregatorEvents {
   resourceUpdated: [server: string, uri: string];
 }
@@ -33,7 +80,7 @@ export interface McpAggregatorEvents {
 export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
   private servers = new Map<string, ServerConnection>();
   private reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private serverConfigs: Array<{ name: string; url: string; token: string; required: boolean; transport: 'sse' | 'streamable-http'; localSecret?: string }> = [];
+  private serverConfigs: McpServerConfig[] = [];
   private _shuttingDown = false;
   private _cleaningUp = false;
 
@@ -44,15 +91,7 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
   async connect(): Promise<void> {
     const config = getConfig();
 
-    this.serverConfigs = [
-      { name: 'discord', url: config.discordMcpUrl, token: config.discordMcpToken, required: true, transport: 'sse' },
-      { name: 'foundry', url: config.foundryMcpUrl, token: config.foundryMcpToken, required: false, transport: 'streamable-http' },
-    ];
-
-    // v2: Wiki is required (hard gate) — uses Streamable HTTP (wiki SSE transport is send-only)
-    if (config.wikiMcpUrl) {
-      this.serverConfigs.push({ name: 'wiki', url: config.wikiMcpUrl, token: config.wikiMcpToken, required: true, transport: 'streamable-http', localSecret: config.wikiMcpLocalSecret });
-    }
+    this.serverConfigs = buildServerConfigs(config);
 
     const results = await Promise.allSettled(
       this.serverConfigs.map((conn) => this.connectServer(conn.name, conn.url, conn.token, conn.required, conn.transport, conn.localSecret ?? ''))
@@ -88,20 +127,21 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
     }
   }
 
-  private async connectServer(name: string, baseUrl: string, token: string, required: boolean, transportType: 'sse' | 'streamable-http' = 'sse', localSecret = ''): Promise<void> {
+  private async connectServer(name: string, baseUrl: string, token: string, required: boolean, transportType: McpTransportType = 'streamable-http', localSecret = ''): Promise<void> {
     const authHeaders: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
     // Same-box trusted-caller bypass: present the shared secret so the wiki MCP
     // server's hardened gate grants the default identity without an OAuth token.
     if (localSecret) authHeaders['X-MCP-Local'] = localSecret;
 
+    const endpointPath = mcpEndpointPath(transportType);
     let transport: SSEClientTransport | StreamableHTTPClientTransport;
     if (transportType === 'streamable-http') {
-      const httpUrl = new URL('/mcp', baseUrl);
+      const httpUrl = new URL(endpointPath, baseUrl);
       transport = new StreamableHTTPClientTransport(httpUrl, {
         requestInit: { headers: authHeaders },
       });
     } else {
-      const sseUrl = new URL('/sse', baseUrl);
+      const sseUrl = new URL(endpointPath, baseUrl);
       if (token) {
         sseUrl.searchParams.set('token', token);
       }
@@ -156,7 +196,7 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
     };
   }
 
-  private scheduleReconnect(name: string, baseUrl: string, token: string, required: boolean, transportType: 'sse' | 'streamable-http' = 'sse', localSecret = '', attempt = 1): void {
+  private scheduleReconnect(name: string, baseUrl: string, token: string, required: boolean, transportType: McpTransportType = 'streamable-http', localSecret = '', attempt = 1): void {
     if (this._shuttingDown) return;
     if (this.reconnectTimers.has(name)) return; // Already scheduled
 

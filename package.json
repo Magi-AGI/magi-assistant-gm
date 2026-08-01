@@ -7,7 +7,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test:qa": "tsx test/qa-regressions.ts"
+    "test:qa": "tsx test/qa-regressions.ts",
+    "test:transport": "tsx test/smoke-transport.ts"
   },
   "license": "MIT",
   "engines": {

@@ -145,6 +145,8 @@ export function getConfig(): GmConfig {
   if (discordMcpToken) registerSecret(discordMcpToken);
   if (foundryMcpToken) registerSecret(foundryMcpToken);
   if (wikiMcpToken) registerSecret(wikiMcpToken);
+  // X-MCP-Local shared secret — redact from logs like any other credential.
+  if (wikiMcpLocalSecret) registerSecret(wikiMcpLocalSecret);
 
   const wikiMcpUrl = process.env.WIKI_MCP_URL ?? '';
   if (!wikiMcpUrl) {
