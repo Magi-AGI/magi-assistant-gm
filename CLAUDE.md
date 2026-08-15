@@ -6,7 +6,7 @@ AI GM Assistant v2 — event-driven, stage-manager-style Fate Core GM advisor. C
 ## Tech Stack
 - TypeScript + Node.js
 - @anthropic-ai/sdk for Claude reasoning with tool use
-- @modelcontextprotocol/sdk for MCP client connections (SSE transport)
+- @modelcontextprotocol/sdk for MCP client connections (StreamableHTTP transport at `/mcp`; legacy SSE `/sse` path retained as a fallback but unused)
 
 ## Build & Run
 - `npm run build` — compile TypeScript
