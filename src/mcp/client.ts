@@ -77,12 +77,23 @@ export interface McpAggregatorEvents {
   resourceUpdated: [server: string, uri: string];
 }
 
+/** Everything needed to rebuild a connection after it drops. */
+interface ReconnectParams {
+  baseUrl: string;
+  token: string;
+  required: boolean;
+  transportType: McpTransportType;
+  localSecret: string;
+}
+
 export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
   private servers = new Map<string, ServerConnection>();
   private reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private serverConfigs: McpServerConfig[] = [];
   private _shuttingDown = false;
   private _cleaningUp = false;
+  /** Servers currently inside handleTransportFailure — guards against re-entry. */
+  private _handlingFailure = new Set<string>();
 
   /**
    * Connect to all configured MCP servers in parallel.
@@ -154,6 +165,35 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
       { capabilities: {} }
     );
 
+    const reconnect: ReconnectParams = { baseUrl, token, required, transportType, localSecret };
+
+    // Install transport callbacks BEFORE client.connect(). The SDK's Protocol
+    // layer wraps whatever handler is already on the transport and chains it
+    // (shared/protocol.js Protocol.connect). Assigning after connect() would
+    // overwrite that wrapper, so protocol-level cleanup — rejecting pending
+    // response handlers, clearing progress/notification state — would never run
+    // on disconnect.
+    //
+    // Both handlers are inert until this connection is registered in `servers`
+    // (see the identity guard in handleTransportFailure), so a failed initial
+    // handshake still surfaces as a thrown error rather than a reconnect loop.
+    transport.onclose = () => {
+      // A close is definitive — no liveness probe, tear down immediately.
+      void this.handleTransportFailure(name, transport, client, 'connection closed', true, reconnect);
+    };
+
+    transport.onerror = (err) => {
+      // NOTE: onclose does NOT necessarily follow onerror. When the SDK
+      // exhausts its own SSE reconnection budget it calls
+      // onerror(new Error('Maximum reconnection attempts (N) exceeded.')) and
+      // returns — onclose is only emitted by an explicit close(). Treating
+      // onerror as informational leaves the server in `servers` forever while
+      // its stream is dead, which is exactly how a Foundry restart used to
+      // leave GM degraded while systemd still reported it healthy.
+      const reason = err instanceof Error ? err.message : String(err);
+      void this.handleTransportFailure(name, transport, client, reason, false, reconnect);
+    };
+
     // Timeout: if handshake doesn't complete in 10s, close transport and abort
     let connectTimer: ReturnType<typeof setTimeout> | null = null;
     try {
@@ -178,22 +218,79 @@ export class McpAggregator extends EventEmitter<McpAggregatorEvents> {
       inputSchema: t.inputSchema as Record<string, unknown> | undefined,
     }));
 
+    // Arms the callbacks installed above.
     this.servers.set(name, { client, tools, transport, url: baseUrl, required });
     logger.info(`MCP aggregator: connected to '${name}' — ${tools.length} tools`);
+  }
 
-    // Monitor for disconnection — SSEClientTransport emits 'close' or errors
-    transport.onclose = () => {
+  /**
+   * Single teardown path for a dropped or degraded connection.
+   *
+   * `definitive` distinguishes a close (certain) from an error (may be
+   * transient). Errors are verified with a liveness probe first so a
+   * recoverable stream hiccup doesn't cost a full re-handshake.
+   */
+  private async handleTransportFailure(
+    name: string,
+    transport: SSEClientTransport | StreamableHTTPClientTransport,
+    client: Client,
+    reason: string,
+    definitive: boolean,
+    reconnect: ReconnectParams
+  ): Promise<void> {
+    if (this._shuttingDown || this._cleaningUp) return;
+
+    // Identity/arming guard: ignore callbacks from a transport that isn't the
+    // currently registered one. Covers both a not-yet-armed initial handshake
+    // and a superseded transport firing late during reconnect churn.
+    if (this.servers.get(name)?.transport !== transport) return;
+
+    // Reentrancy guard: the liveness probe and client.close() below both route
+    // through this same transport, and a failing send() re-invokes onerror.
+    if (this._handlingFailure.has(name)) return;
+    this._handlingFailure.add(name);
+
+    try {
+      if (definitive) {
+        logger.warn(`MCP aggregator: lost connection to '${name}' (${reason}) — scheduling reconnect`);
+      } else {
+        logger.warn(`MCP aggregator: error on '${name}': ${reason}`);
+        if (await this.healthCheck(name)) {
+          logger.info(`MCP aggregator: '${name}' still responsive after transport error — keeping connection`);
+          return;
+        }
+        logger.warn(`MCP aggregator: '${name}' failed liveness probe — scheduling reconnect`);
+      }
+
+      // Re-check: shutdown may have begun, or the connection been replaced,
+      // while the probe was in flight.
       if (this._shuttingDown || this._cleaningUp) return;
-      logger.warn(`MCP aggregator: lost connection to '${name}' — scheduling reconnect`);
+      if (this.servers.get(name)?.transport !== transport) return;
+
+      // Deregister before closing so the onclose this triggers fails the
+      // identity guard and cannot schedule a second reconnect ladder.
       this.servers.delete(name);
-      this.scheduleReconnect(name, baseUrl, token, required, transportType, localSecret);
-    };
 
-    transport.onerror = (err) => {
-      if (this._shuttingDown || this._cleaningUp) return;
-      logger.warn(`MCP aggregator: error on '${name}':`, err);
-      // onclose will fire after onerror, triggering reconnect
-    };
+      // Close at the client level so the SDK protocol layer clears its pending
+      // request/progress state; it delegates to transport.close(), which aborts
+      // the transport's AbortController and clears its internal reconnect timer.
+      try {
+        await client.close();
+      } catch {
+        await transport.close().catch(() => {});
+      }
+
+      this.scheduleReconnect(
+        name,
+        reconnect.baseUrl,
+        reconnect.token,
+        reconnect.required,
+        reconnect.transportType,
+        reconnect.localSecret
+      );
+    } finally {
+      this._handlingFailure.delete(name);
+    }
   }
 
   private scheduleReconnect(name: string, baseUrl: string, token: string, required: boolean, transportType: McpTransportType = 'streamable-http', localSecret = '', attempt = 1): void {
